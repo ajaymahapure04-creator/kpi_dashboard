@@ -97,64 +97,143 @@ const REGION_SHARE = { Europe: 0.48, "North America": 0.17, China: 0.24, "South 
 const PLATFORM_SHARE = { MQB: 0.38, MLB: 0.22, MEB: 0.28, PPE: 0.12 };
 const RECALL_SHARE = { "R-2214": 0.04, "R-2260": 0.03, "R-2301": 0.02 };
 
-/* Which brand / region / platform / recall combinations actually exist.
-   Cascading filter options are derived from this table: a value stays
-   selectable only while at least one combination matches the selections
-   in the other dimensions. */
-const BRAND_MATRIX = {
-  VW: { regions: ["Europe", "North America", "China", "South America", "RoW"], platforms: ["MQB", "MEB"] },
-  Audi: { regions: ["Europe", "North America", "China"], platforms: ["MLB", "MEB", "PPE"] },
-  Porsche: { regions: ["Europe", "North America", "China"], platforms: ["MLB", "PPE"] },
-  "Škoda": { regions: ["Europe", "China", "RoW"], platforms: ["MQB", "MEB"] },
-  CUPRA: { regions: ["Europe", "South America"], platforms: ["MQB", "MEB"] },
-  MAN: { regions: ["Europe", "South America", "RoW"], platforms: ["MQB", "MLB"] },
-};
-const RECALL_DEFS = [
-  { id: "R-2214", brands: ["VW", "Škoda"], platforms: ["MEB"] },
-  { id: "R-2260", brands: ["Audi", "Porsche"], platforms: ["PPE"] },
-  { id: "R-2301", brands: ["MAN"], platforms: ["MQB"] },
-];
-const RECALL_IDS = RECALL_DEFS.map((r) => r.id);
-
-const COMBOS = Object.entries(BRAND_MATRIX).flatMap(([brand, m]) =>
-  m.regions.flatMap((region) =>
-    m.platforms.map((platform) => ({
-      brand, region, platform,
-      recalls: RECALL_DEFS.filter((r) => r.brands.includes(brand) && r.platforms.includes(platform)).map((r) => r.id),
-    }))
-  )
-);
-
 // Empty array = "All" (no constraint on that dimension)
 const DEFAULT_FILTERS = {
   region: [], brand: [], platform: [], recall: [],
   from: "2021-01-01", to: "2026-07-07",
 };
 
-// Does a combination row survive the current selections, ignoring one dimension?
-function comboMatches(c, f, skipDim) {
-  return (
-    (skipDim === "brand" || !f.brand.length || f.brand.includes(c.brand)) &&
-    (skipDim === "region" || !f.region.length || f.region.includes(c.region)) &&
-    (skipDim === "platform" || !f.platform.length || f.platform.includes(c.platform)) &&
-    (skipDim === "recall" || !f.recall.length || c.recalls.some((r) => f.recall.includes(r)))
-  );
+function normalizeCampaignValue(row) {
+  return row.campaign ?? row.Campaign ?? row.campaign_id ?? row.id ?? row.name ?? "";
 }
 
-// Values of `dim` still available given the selections in the other dimensions
-function availableFor(dim, f) {
-  const rows = COMBOS.filter((c) => comboMatches(c, f, dim));
-  if (dim === "recall") return new Set(rows.flatMap((c) => c.recalls));
-  return new Set(rows.map((c) => c[dim]));
+function normalizeCountryValue(row) {
+  return row.country_name ?? row.country ?? row.country_iso ?? row.iso ?? row.id ?? row.name ?? "";
 }
 
-// Drop selections that the other dimensions have cascaded away
-function cascadeFilters(f) {
-  const out = { ...f };
-  for (const dim of ["brand", "region", "platform", "recall"]) {
-    const avail = availableFor(dim, out);
-    out[dim] = out[dim].filter((v) => avail.has(v));
+function normalizeRegionValue(row) {
+  return row.region_name ?? row.region ?? row.Region ?? "";
+}
+
+function normalizeBrandValue(row) {
+  return (row.brand || row.Brand || "").toString();
+}
+
+function normalizePlatformValue(row) {
+  return row.platform || row.Platform || "";
+}
+
+function normalizeRecallValue(row) {
+  return row.recall || row.Recall || row.recall_id || row.Recall_ID || "";
+}
+
+function makeRowId(row) {
+  // Prefer campaign as the stable identifier; fall back to composite if missing.
+  const campaign = (row.campaign || row.Campaign || row.campaign_id || row.id || row.name || "").toString();
+  if (campaign) return `campaign:${campaign}`;
+  const country = (row.country_iso || row.iso || row.country || "").toString();
+  const recall = (row.recall || row.Recall || row.recall_id || row.Recall_ID || "").toString();
+  const tech = (row.updated_technology || row.Update_Technology || row.update_technology || "").toString();
+  const platform = (row.platform || row.Platform || "").toString();
+  return `fallback:${country}||${recall}||${tech}||${platform}`;
+}
+
+function buildCountryLookup(rows) {
+  const lookup = new Map();
+  for (const row of rows) {
+    const iso = row.country_iso ?? row.iso ?? row.id;
+    if (!iso) continue;
+    lookup.set(iso, {
+      country: normalizeCountryValue(row),
+      region: normalizeRegionValue(row),
+    });
   }
+  return lookup;
+}
+
+function buildCampaignLookup(rows) {
+  const lookup = new Map();
+  for (const row of rows) {
+    const campaign = normalizeCampaignValue(row);
+    if (!campaign) continue;
+    lookup.set(campaign, {
+      brand: normalizeBrandValue(row),
+      platform: normalizePlatformValue(row),
+      recall: normalizeRecallValue(row),
+    });
+  }
+  return lookup;
+}
+
+function uniqueDimValues(rows, getter) {
+  return [...new Set(rows.map(getter).filter(Boolean))].sort();
+}
+
+function matchesRowFilters(row, filters, countryLookup, campaignLookup) {
+  const rowCampaign = normalizeCampaignValue(row);
+  const campaign = campaignLookup.get(rowCampaign) || {};
+  const rowBrand = row.brand || row.Brand || campaign.brand || "";
+  const rowPlatform = row.platform || row.Platform || campaign.platform || "";
+  const rowRecall = row.recall || row.Recall || campaign.recall || rowCampaign;
+  const lookup = countryLookup.get(row.country_iso || row.country || row.iso || "") || {};
+  const rowRegion = lookup.region || row.region || row.Region || "";
+
+  if (filters.brand.length && !filters.brand.includes(rowBrand)) return false;
+  if (filters.platform.length && !filters.platform.includes(rowPlatform)) return false;
+  if (filters.recall.length && !rowRecall) return false;
+  if (filters.recall.length && !filters.recall.includes(rowRecall)) return false;
+  if (filters.region.length && !filters.region.includes(rowRegion)) return false;
+  return true;
+}
+
+function getAvailableDimensionOptions(filters, campaignRows, countryRows) {
+  const available = {
+    region: new Set(),
+    brand: new Set(),
+    platform: new Set(),
+    recall: new Set(),
+  };
+
+  for (const row of campaignRows) {
+    const rowRegion = normalizeRegionValue(row);
+    const rowBrand = normalizeBrandValue(row);
+    const rowPlatform = normalizePlatformValue(row);
+    const rowRecall = normalizeRecallValue(row);
+
+    if (filters.region.length && !filters.region.includes(rowRegion)) continue;
+    if (filters.brand.length && !filters.brand.includes(rowBrand)) continue;
+    if (filters.platform.length && !filters.platform.includes(rowPlatform)) continue;
+    if (filters.recall.length && !filters.recall.includes(rowRecall)) continue;
+
+    if (rowBrand) available.brand.add(rowBrand);
+    if (rowPlatform) available.platform.add(rowPlatform);
+    if (rowRecall) available.recall.add(rowRecall);
+    if (rowRegion) available.region.add(rowRegion);
+  }
+
+  if (!filters.brand.length && !filters.platform.length && !filters.recall.length) {
+    for (const row of countryRows) {
+      const region = normalizeRegionValue(row);
+      if (region) available.region.add(region);
+    }
+  }
+
+  if (!campaignRows.length) {
+    for (const row of countryRows) {
+      const region = normalizeRegionValue(row);
+      if (region) available.region.add(region);
+    }
+  }
+
+  return available;
+}
+
+function cascadeFilters(filters, available) {
+  const out = { ...filters };
+  out.brand = out.brand.filter((v) => available.brand.has(v));
+  out.platform = out.platform.filter((v) => available.platform.has(v));
+  out.recall = out.recall.filter((v) => available.recall.has(v));
+  out.region = out.region.filter((v) => available.region.has(v));
   return out;
 }
 
@@ -164,7 +243,12 @@ function cascadeFilters(f) {
 const sumShare = (sel, table) => (sel.length ? Math.min(1, sel.reduce((a, k) => a + (table[k] ?? 0.08), 0)) : 1);
 
 function filterScope(filters) {
-  const active = [...filters.brand, ...filters.region, ...filters.platform, ...filters.recall];
+  const active = [
+    ...filters.brand,
+    ...filters.region,
+    ...filters.platform,
+    ...filters.recall,
+  ];
   const scale =
     sumShare(filters.brand, BRAND_SHARE) *
     sumShare(filters.region, REGION_SHARE) *
@@ -381,6 +465,132 @@ function scopedKpi(kpi, scope) {
   };
 }
 
+function getNumericField(row, keys) {
+  for (const key of keys) {
+    const value = row[key];
+    if (value === undefined || value === null || value === "") continue;
+    const num = Number(value);
+    if (!Number.isNaN(num)) return num;
+  }
+  return 0;
+}
+
+function sumField(rows, keys) {
+  return rows.reduce((sum, row) => sum + getNumericField(row, keys), 0);
+}
+
+function averageField(rows, keys) {
+  if (!rows.length) return null;
+  const total = rows.reduce((sum, row) => sum + getNumericField(row, keys), 0);
+  return total / rows.length;
+}
+
+function formatLargeNumber(value) {
+  const abs = Math.abs(value);
+  if (abs >= 1e9) return `${(value / 1e9).toFixed(1)}bn`;
+  if (abs >= 1e6) return `${(value / 1e6).toFixed(1)}M`;
+  if (abs >= 1e3) return `${(value / 1e3).toFixed(1)}K`;
+  return `${value.toFixed(1)}`;
+}
+
+function valueForKpi(rows, kpiId) {
+  if (!rows || !rows.length) return null;
+  switch (kpiId) {
+    case "updates":
+      return sumField(rows, ["successful_updates"]);
+    case "quality": {
+      const totalUpdates = sumField(rows, ["successful_updates"]);
+      const weightedQuality = rows.reduce((sum, row) => {
+        const quality = getNumericField(row, ["quality"]);
+        const updates = getNumericField(row, ["successful_updates"]);
+        return sum + quality * updates;
+      }, 0);
+      return totalUpdates ? weightedQuality / totalUpdates : averageField(rows, ["quality"]);
+    }
+    case "liegenbleiber": {
+      const totalUpdates = sumField(rows, ["successful_updates"]);
+      const totalWarnings = sumField(rows, ["customerWarning_minor", "customerWarning_major"]);
+      return totalUpdates ? (totalWarnings / totalUpdates) * 1000 : null;
+    }
+    case "adoption": {
+      const installs = sumField(rows, ["update_operations"]);
+      const eligible = sumField(rows, ["lb_common_vehicles", "lb_backend_vehicles", "lb_aftersales_vehicles"]);
+      return eligible ? (installs / eligible) * 100 : null;
+    }
+    case "duration":
+      return averageField(rows, ["downtime_minutes"]);
+    case "cost":
+      return sumField(rows, ["cost_savings"]);
+    case "co2":
+      return sumField(rows, ["co2_savings"]);
+    default:
+      return null;
+  }
+}
+
+function formatKpiValue(value, kpiId) {
+  if (value == null || Number.isNaN(value)) return "N/A";
+  switch (kpiId) {
+    case "updates":
+      return formatLargeNumber(value);
+    case "quality":
+    case "liegenbleiber":
+    case "duration":
+      return `${value.toFixed(1)}`;
+    case "adoption":
+      return `${value.toFixed(1)}%`;
+    case "cost":
+    case "co2":
+      return formatLargeNumber(value);
+    default:
+      return `${value}`;
+  }
+}
+
+function runtimeKpi(kpi, rows, scope) {
+  const actualValue = valueForKpi(rows, kpi.id);
+  if (actualValue == null) return scopedKpi(kpi, scope);
+  return scopedKpi({ ...kpi, value: formatKpiValue(actualValue, kpi.id) }, scope);
+}
+
+function buildKpiSeries(rows, kpiId, range) {
+  if (!rows || !rows.length) return [];
+  const dateMap = new Map();
+  for (const row of rows) {
+    const rawDate = row.date ?? row.Date;
+    const parsed = rawDate ? new Date(rawDate) : null;
+    if (!parsed || Number.isNaN(parsed.valueOf())) continue;
+    const key = parsed.toISOString().slice(0, 10);
+    const bucket = dateMap.get(key) || [];
+    bucket.push(row);
+    dateMap.set(key, bucket);
+  }
+  const series = Array.from(dateMap.entries())
+    .map(([key, bucket]) => ({
+      date: new Date(key),
+      value: valueForKpi(bucket, kpiId) ?? 0,
+    }))
+    .sort((a, b) => a.date - b.date);
+  const trimmed = range && series.length > range ? series.slice(-range) : series;
+  return trimmed.map((item) => ({
+    date: item.date.toLocaleDateString("en-GB", { day: "2-digit", month: "short" }),
+    value: Number(item.value.toFixed(2)),
+  }));
+}
+
+function buildKpiBreakdown(rows, kpiId, dimension) {
+  if (!rows || !rows.length) return [];
+  const groups = new Map();
+  for (const row of rows) {
+    const key = row[dimension] ?? row[dimension.charAt(0).toUpperCase() + dimension.slice(1)] ?? "Unknown";
+    const current = groups.get(key) || 0;
+    groups.set(key, current + (valueForKpi([row], kpiId) ?? 0));
+  }
+  return Array.from(groups.entries())
+    .map(([name, value]) => ({ name, value }))
+    .sort((a, b) => b.value - a.value);
+}
+
 /* ------------------------------------------------------------------ */
 /* Shared chrome                                                       */
 /* ------------------------------------------------------------------ */
@@ -407,7 +617,7 @@ function ThemeToggle({ theme, onToggle }) {
   );
 }
 
-function TopBar({ theme, onToggleTheme, navOpen, onToggleNav }) {
+function TopBar({ theme, onToggleTheme, navOpen, onToggleNav, backendStatus }) {
   return (
     <div
       className="flex items-center justify-between px-4 py-2 shrink-0"
@@ -448,7 +658,7 @@ function TopBar({ theme, onToggleTheme, navOpen, onToggleNav }) {
 const NAV_ORDER = ["updates", "co2", "cost", "adoption", "quality", "liegenbleiber", "duration"];
 const NAV_WIDTH = 230;
 
-function SideNav({ open, onClose, route, onNavigate }) {
+function SideNav({ open, onClose, route, onNavigate, backendStatus }) {
   const activeId = route.page === "detail" ? route.kpiId : null;
   const item = (active, onClick, icon, label, key) => (
     <button
@@ -486,6 +696,9 @@ function SideNav({ open, onClose, route, onNavigate }) {
             const active = activeId === id;
             return item(active, () => onNavigate({ page: "detail", kpiId: id }), <Icon size={15} color={active ? C.accent : C.dim} />, kpi.title, id);
           })}
+        </div>
+        <div className="px-3 py-2 shrink-0" style={{ borderTop: `1px solid ${C.cardBorderSoft}`, background: C.panel }}>
+          <span className="text-xs" style={{ color: C.dim }}>{backendStatus}</span>
         </div>
       </div>
     </div>
@@ -626,27 +839,29 @@ function Select({ label, value, options, onChange }) {
   );
 }
 
-function FilterBar({ filters, setFilters }) {
+function FilterBar({ filters, setFilters, regionOptions, brandOptions, platformOptions, recallOptions, campaignRows, countryRows }) {
+  const available = getAvailableDimensionOptions(filters, campaignRows, countryRows);
   const set = (k) => (v) => setFilters((f) => ({ ...f, [k]: v }));
-  // A change in one dimension re-cascades the others
-  const setDim = (dim) => (vals) => setFilters((f) => cascadeFilters({ ...f, [dim]: vals }));
+  // A change in one dimension re-cascades the others using actual dimension availability.
+  const setDim = (dim) => (vals) => setFilters((f) => {
+    const next = { ...f, [dim]: vals };
+    const nextAvailable = getAvailableDimensionOptions(next, campaignRows, countryRows);
+    return cascadeFilters(next, nextAvailable);
+  });
   const reset = () => setFilters(DEFAULT_FILTERS);
   const scope = filterScope(filters);
-  const optsFor = (dim, all) => {
-    const avail = availableFor(dim, filters);
-    return all.map((v) => ({ v, enabled: avail.has(v) }));
-  };
+  const optsFor = (dim, all) => all.map((v) => ({ v, enabled: available[dim].has(v) }));
   return (
     <div
       className="flex flex-wrap items-end gap-3 px-4 py-2 shrink-0"
       style={{ background: C.panel, borderBottom: `1px solid ${C.cardBorderSoft}` }}
     >
       <VLabel>SCOPE</VLabel>
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 flex-1 min-w-0" style={{ maxWidth: 720 }}>
-        <MultiSelect label="Region" values={filters.region} options={optsFor("region", REGIONS)} onChange={setDim("region")} />
-        <MultiSelect label="Brand" values={filters.brand} options={optsFor("brand", BRANDS)} onChange={setDim("brand")} />
-        <MultiSelect label="Platform" values={filters.platform} options={optsFor("platform", PLATFORMS)} onChange={setDim("platform")} />
-        <MultiSelect label="Recall ID" values={filters.recall} options={optsFor("recall", RECALL_IDS)} onChange={setDim("recall")} />
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 flex-1 min-w-0" style={{ maxWidth: 960 }}>
+        <MultiSelect label="Region" values={filters.region} options={optsFor("region", regionOptions)} onChange={setDim("region")} />
+        <MultiSelect label="Brand" values={filters.brand} options={optsFor("brand", brandOptions)} onChange={setDim("brand")} />
+        <MultiSelect label="Platform" values={filters.platform} options={optsFor("platform", platformOptions)} onChange={setDim("platform")} />
+        <MultiSelect label="Recall ID" values={filters.recall} options={optsFor("recall", recallOptions)} onChange={setDim("recall")} />
       </div>
       <div className="flex items-stretch gap-2">
         <VLabel>TIME</VLabel>
@@ -812,10 +1027,10 @@ function DlcmLink({ icon: Icon, l1, l2, disabled, onClick }) {
   );
 }
 
-function Overview({ onOpen, onDlcm, filters }) {
+function Overview({ onOpen, onDlcm, filters, filteredRows }) {
   const scope = filterScope(filters);
-  const primaries = KPIS.filter((k) => k.tier === "primary").map((k) => scopedKpi(k, scope));
-  const secondaries = KPIS.filter((k) => k.tier === "secondary").map((k) => scopedKpi(k, scope));
+  const primaries = KPIS.filter((k) => k.tier === "primary").map((k) => runtimeKpi(k, filteredRows, scope));
+  const secondaries = KPIS.filter((k) => k.tier === "secondary").map((k) => runtimeKpi(k, filteredRows, scope));
   return (
     <div className="px-4 py-1.5 flex flex-col gap-1.5" style={{ minHeight: "100%" }}>
       <section className="flex-[4] min-h-0 flex flex-col">
@@ -873,24 +1088,30 @@ function BackButton({ onBack }) {
   );
 }
 
-function Detail({ kpiId, onBack, filters }) {
+function Detail({ kpiId, onBack, filters, filteredRows }) {
   const scope = filterScope(filters);
-  const kpi = scopedKpi(KPIS.find((k) => k.id === kpiId), scope);
+  const kpi = runtimeKpi(KPIS.find((k) => k.id === kpiId), filteredRows, scope);
   const [range, setRange] = useState(30);
   const volScale = kpi.scaleWithFleet ? scope.scale : 1;
-  const series = useMemo(
-    () => genSeries(
+  const series = useMemo(() => {
+    const actualSeries = buildKpiSeries(filteredRows, kpiId, range);
+    return actualSeries.length ? actualSeries : genSeries(
       kpi.seed + scope.seedShift,
       kpi.base * volScale,
       kpi.vol * Math.max(volScale, 0.15),
       range,
       kpi.drift * volScale,
       filters.to
-    ),
-    [kpi.seed, kpi.base, kpi.vol, kpi.drift, volScale, scope.seedShift, range, filters.to]
-  );
-  const byBrand = useMemo(() => genBreakdown(kpi.seed + scope.seedShift, BRANDS, kpi.base * volScale), [kpi.seed, kpi.base, volScale, scope.seedShift]);
-  const byRegion = useMemo(() => genBreakdown(kpi.seed + scope.seedShift + 5, REGIONS, kpi.base * volScale), [kpi.seed, kpi.base, volScale, scope.seedShift]);
+    );
+  }, [filteredRows, kpiId, kpi.seed, kpi.base, kpi.vol, kpi.drift, volScale, scope.seedShift, range, filters.to]);
+  const byBrand = useMemo(() => {
+    const actual = buildKpiBreakdown(filteredRows, kpiId, "brand");
+    return actual.length ? actual : genBreakdown(kpi.seed + scope.seedShift, BRANDS, kpi.base * volScale);
+  }, [filteredRows, kpiId, kpi.seed, kpi.base, volScale, scope.seedShift]);
+  const byRegion = useMemo(() => {
+    const actual = buildKpiBreakdown(filteredRows, kpiId, "region");
+    return actual.length ? actual : genBreakdown(kpi.seed + scope.seedShift + 5, REGIONS, kpi.base * volScale);
+  }, [filteredRows, kpiId, kpi.seed, kpi.base, volScale, scope.seedShift]);
   const Icon = kpi.icon;
   const trendUp = series[series.length - 1].value >= series[0].value;
   const trendGood = kpi.goodWhen === "up" ? trendUp : !trendUp;
@@ -1259,6 +1480,51 @@ export default function App() {
     localStorage.getItem("ota-theme") || "dark"
   );
   const [navOpen, setNavOpen] = useState(() => localStorage.getItem("ota-nav-open") !== "false");
+  const [backendRows, setBackendRows] = useState([]);
+  const [campaignRows, setCampaignRows] = useState([]);
+  const [countryRows, setCountryRows] = useState([]);
+  const [backendError, setBackendError] = useState(null);
+  const [backendLoading, setBackendLoading] = useState(true);
+  const [dimensionError, setDimensionError] = useState(null);
+  const [dimensionLoading, setDimensionLoading] = useState(true);
+
+  const brandOptions = useMemo(
+    () => uniqueDimValues(campaignRows, normalizeBrandValue),
+    [campaignRows]
+  );
+
+  const platformOptions = useMemo(
+    () => uniqueDimValues(campaignRows, normalizePlatformValue),
+    [campaignRows]
+  );
+
+  const recallOptions = useMemo(
+    () => uniqueDimValues(campaignRows, normalizeRecallValue),
+    [campaignRows]
+  );
+
+  const regionOptions = useMemo(
+    () => uniqueDimValues(countryRows, normalizeRegionValue),
+    [countryRows]
+  );
+
+  const countryLookup = useMemo(
+    () => buildCountryLookup(countryRows),
+    [countryRows]
+  );
+
+  const campaignLookup = useMemo(
+    () => buildCampaignLookup(campaignRows),
+    [campaignRows]
+  );
+
+  const filteredRows = useMemo(
+    () => backendRows.filter((row) => matchesRowFilters(row, filters, countryLookup, campaignLookup)),
+    [backendRows, filters, countryLookup, campaignLookup]
+  );
+
+  const scope = filterScope(filters);
+  const scopeSummary = scope.active.length ? scope.active.join(" / ") : "All data";
 
   useEffect(() => {
     localStorage.setItem("ota-nav-open", String(navOpen));
@@ -1283,6 +1549,124 @@ export default function App() {
     return () => window.removeEventListener("hashchange", onHash);
   }, []);
 
+  useEffect(() => {
+    const fetchBackendData = async () => {
+      try {
+        const response = await fetch("/api/fact_main_oru4_prod?limit=1000");
+        if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+        const data = await response.json();
+        setBackendRows(data);
+      } catch (error) {
+        setBackendError(error.message || String(error));
+      } finally {
+        setBackendLoading(false);
+      }
+    };
+
+    const fetchDimensionData = async () => {
+      try {
+        const [campaignRes, countryRes] = await Promise.all([
+          fetch("/api/dim_campaign_combined?limit=1000"),
+          fetch("/api/dim_country_combined?limit=1000"),
+        ]);
+        if (!campaignRes.ok) throw new Error(`Campaign fetch failed: ${campaignRes.status} ${campaignRes.statusText}`);
+        if (!countryRes.ok) throw new Error(`Country fetch failed: ${countryRes.status} ${countryRes.statusText}`);
+        const [campaignData, countryData] = await Promise.all([campaignRes.json(), countryRes.json()]);
+        setCampaignRows(campaignData);
+        setCountryRows(countryData);
+      } catch (error) {
+        setDimensionError(error.message || String(error));
+      } finally {
+        setDimensionLoading(false);
+      }
+    };
+
+    fetchBackendData();
+    fetchDimensionData();
+  }, []);
+
+  // Subscribe to WebSocket for live updates, fallback to SSE if needed
+  useEffect(() => {
+    let ws;
+    let es;
+    const applyPayload = (payload) => {
+      if (!payload) return;
+      if (payload.full && Array.isArray(payload.rows)) {
+        setBackendRows(payload.rows);
+        return;
+      }
+      setBackendRows((prev) => {
+        const map = new Map(prev.map((r) => [makeRowId(r), r]));
+        if (Array.isArray(payload.removed)) {
+          for (const id of payload.removed) map.delete(id);
+        }
+        if (Array.isArray(payload.updated)) {
+          for (const r of payload.updated) map.set(makeRowId(r), r);
+        }
+        if (Array.isArray(payload.added)) {
+          for (const r of payload.added) map.set(makeRowId(r), r);
+        }
+        return Array.from(map.values());
+      });
+    };
+
+    const connectWebSocket = () => {
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const host = window.location.hostname;
+      const wsUrl = import.meta.env.DEV ? `${protocol}//${host}:4000` : `${protocol}//${window.location.host}`;
+      try {
+        ws = new WebSocket(wsUrl);
+        ws.onmessage = (event) => {
+          try {
+            const payload = JSON.parse(event.data);
+            applyPayload(payload);
+          } catch (err) {
+            console.error('WS parse error', err);
+          }
+        };
+        ws.onopen = () => {
+          console.info('WebSocket connected to', wsUrl);
+        };
+        ws.onerror = (error) => {
+          console.error('WebSocket error', error);
+        };
+        ws.onclose = () => {
+          console.info('WebSocket closed, falling back to SSE');
+          connectSSE();
+        };
+      } catch (e) {
+        console.error('WebSocket connect failed', e);
+        connectSSE();
+      }
+    };
+
+    const connectSSE = () => {
+      try {
+        es = new EventSource('/events/fact_main');
+        es.onmessage = (e) => {
+          try {
+            const payload = JSON.parse(e.data);
+            applyPayload(payload);
+          } catch (err) {
+            console.error('SSE parse error', err);
+          }
+        };
+        es.onerror = (err) => {
+          console.error('EventSource error', err);
+        };
+      } catch (e) {
+        console.error('SSE not supported or failed to connect', e);
+      }
+    };
+
+    connectWebSocket();
+
+    return () => {
+      if (ws) ws.close();
+      if (es) es.close();
+    };
+  }, []);
+
   const setRoute = (r) => {
     window.location.hash = routeToHash(r);
     setRouteState(r);
@@ -1294,10 +1678,27 @@ export default function App() {
       <TopBar
         theme={theme} onToggleTheme={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
         navOpen={navOpen} onToggleNav={() => setNavOpen((o) => !o)}
+        backendStatus={
+          backendLoading || dimensionLoading
+            ? "Loading backend…"
+            : backendError || dimensionError
+              ? `Backend error: ${backendError || dimensionError}`
+              : `${filteredRows.length} rows matched from ${backendRows.length} backend rows · ${scopeSummary}`
+        }
       />
-      <FilterBar filters={filters} setFilters={setFilters} />
+      <FilterBar
+        filters={filters}
+        setFilters={setFilters}
+        regionOptions={regionOptions}
+        brandOptions={brandOptions}
+        platformOptions={platformOptions}
+        recallOptions={recallOptions}
+        campaignRows={campaignRows}
+        countryRows={countryRows}
+      />
       <div className="flex-1 min-h-0 flex flex-row">
-        <SideNav open={navOpen} onClose={() => setNavOpen(false)} route={route} onNavigate={setRoute} />
+        <SideNav open={navOpen} onClose={() => setNavOpen(false)} route={route} onNavigate={setRoute}
+          backendStatus={backendLoading ? "Loading backend…" : backendError ? `Backend error: ${backendError}` : `${backendRows.length} backend rows loaded`} />
         {/* Pages fill the remaining viewport height. The Overview/landing page
             never shows a scrollbar — it clips instead of scrolling on windows
             too short to fit it. Detail/DLCM pages keep a scroll fallback since
