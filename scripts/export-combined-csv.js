@@ -10,7 +10,9 @@ const DATA_DIR = path.resolve(process.cwd(), 'data');
 // Determine export max rows from CLI or environment.
 // - CLI: `--max=5000` or `--all`
 // - ENV: `EXPORT_MAX_ROWS=5000` or `EXPORT_MAX_ROWS=all`
-// A value of 0 or "all" means no LIMIT (export everything).
+// A value of 0 or "all" means no LIMIT (export everything). Exports
+// everything by default when no flag/env var is given at all — pass
+// `--max=1000` explicitly if you want a capped sample instead.
 const argv = process.argv.slice(2);
 // allow exporting a single file: --only=filename.csv
 const ONLY_ARG = argv.find((a) => a.startsWith('--only='));
@@ -32,7 +34,7 @@ function parseMaxRows() {
     const n = Number(envVal);
     return Number.isFinite(n) && n >= 0 ? n : 1000;
   }
-  return 1000;
+  return 0; // no flag/env given -> export everything, same as --all
 }
 
 const MAX_ROWS = parseMaxRows();
