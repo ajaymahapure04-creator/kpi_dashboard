@@ -1,7 +1,6 @@
-node_modules
-dist
-.vite
 .env
-*.local
-.DS_Store
-Thumbs.db
+__pycache__/
+*.pyc
+.venv/
+venv/
+node_modules/

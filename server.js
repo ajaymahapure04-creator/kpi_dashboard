@@ -281,19 +281,22 @@ async function queryTablesCombined(tableConfigs, limit = 100) {
         if (row.Platform !== undefined && row.platform === undefined) row.platform = row.Platform;
         if (row.Update_Technology !== undefined) delete row.Update_Technology;
         if (row.Platform !== undefined) delete row.Platform;
-        let tech = row.updated_technology || row.Update_Technology || row.update_technology;
-        if (!tech) {
-          const lname = (t.name || '').toLowerCase();
-          if (lname.includes('oru4')) tech = 'ORU4';
-          else if (lname.includes('oru23')) tech = 'ORU23';
+        const tech = row.updated_technology || row.Update_Technology || row.update_technology;
+        if (!t.skipMetadata) {
+          let inferredTech = tech;
+          if (!inferredTech) {
+            const lname = (t.name || '').toLowerCase();
+            if (lname.includes('oru4')) inferredTech = 'ORU4';
+            else if (lname.includes('oru23')) inferredTech = 'ORU23';
+          }
+          if (inferredTech && row.updated_technology === undefined) row.updated_technology = inferredTech;
+          let platform = row.platform || row.Platform;
+          if (!platform && inferredTech) {
+            if (inferredTech === 'ORU4') platform = 'MEB';
+            else if (inferredTech === 'ORU23') platform = 'MQB/MLB';
+          }
+          if (platform && row.platform === undefined) row.platform = platform;
         }
-        if (tech && row.updated_technology === undefined) row.updated_technology = tech;
-        let platform = row.platform || row.Platform || row.Platform;
-        if (!platform && tech) {
-          if (tech === 'ORU4') platform = 'MEB';
-          else if (tech === 'ORU23') platform = 'MQB/MLB';
-        }
-        if (platform && row.platform === undefined) row.platform = platform;
         rows.push(row);
       }
       return rows;
@@ -309,20 +312,12 @@ async function queryTablesCombined(tableConfigs, limit = 100) {
 }
 
 async function queryFactMainCombined(limit = 100, skipEnrich = false) {
-  const tables = [
-    { name: 'fact_main_oru4_prod', metadata: { Update_Technology: 'ORU4', Platform: 'MEB' } },
-    { name: 'fact_main_oru23' },
-    { name: 'fact_main_oru4_nar' },
-    { name: 'fact_main_orunext' },
-    // Include NA / INT source table
-    { name: 'fact_main_oru4_int', metadata: { Update_Technology: 'ORU4', Platform: 'NA' }, connectionHint: 'int' },
-  ];
-  const rows = await queryTablesCombined(tables, limit);
+  const rows = await queryFactMainEUwithUSCACombined(limit);
   if (skipEnrich) return rows;
   try {
     const [campaignRows, countryRows] = await Promise.all([
-      queryDimCampaignCombined(1000),
-      queryDimCountryCombined(1000),
+      queryDimCampaignEUwithUSCANARCombined(1000),
+      queryDimCountryEUwithUSCANARCombined(1000),
     ]);
     return enrichFactRows(rows, campaignRows, countryRows);
   } catch (error) {
@@ -338,6 +333,7 @@ async function queryFactMainEUwithUSCACombined(limit = 100) {
     { name: 'fact_main_oru4_nar', metadata: { Source: 'EU' } },
     { name: 'fact_main_orunext', metadata: { Source: 'EU' } },
     { name: 'fact_main_oru4_prod', metadata: { Update_Technology: 'ORU4', Platform: 'USCA' }, connectionHint: 'usca' },
+    { name: 'fact_main_oru4_int', metadata: { Source: 'USCA', Update_Technology: 'ORU4' }, connectionHint: 'usca' },
   ];
   return queryTablesCombined(tables, limit);
 }
@@ -430,21 +426,11 @@ app.get('/events/fact_main', (req, res) => {
 });
 
 async function queryFactTargetedVehiclesCombined(limit = 100) {
-  const tables = [
-    { name: 'fact_targeted_vehicles_oru4_prod', metadata: { Update_Technology: 'ORU4', Platform: 'MEB' } },
-    { name: 'fact_targeted_vehicles_oru23' },
-    { name: 'fact_targeted_vehicles_oru4_nar' },
-  ];
-  return queryTablesCombined(tables, limit);
+  return queryFactTargetedVehiclesEUwithUSCACombined(limit);
 }
 
 async function queryFactAdoptionRateCombined(limit = 100) {
-  const tables = [
-    { name: 'fact_adoption_rate_oru4_prod', metadata: { Update_Technology: 'ORU4', Platform: 'MEB' } },
-    { name: 'fact_adoption_rate_oru23' },
-    { name: 'fact_adoption_rate_oru4_nar' },
-  ];
-  return queryTablesCombined(tables, limit);
+  return queryFactAdoptionRateEUwithUSCACombined(limit);
 }
 
 async function queryFactAdoptionRateEUwithUSCACombined(limit = 100) {
@@ -474,32 +460,15 @@ async function queryFactEcuEUCombined(limit = 100) {
 }
 
 async function queryFactReleaseCombined(limit = 100) {
-  const tables = [
-    { name: 'fact_release_oru4_prod', metadata: { Update_Technology: 'ORU4', Platform: 'MEB' } },
-    { name: 'fact_release_oru23' },
-    { name: 'fact_release_oru4_nar' },
-  ];
-  return queryTablesCombined(tables, limit);
+  return queryFactReleaseEUwithUSCACombined(limit);
 }
 
 async function queryDimCampaignCombined(limit = 100) {
-  const tables = [
-    { name: 'dim_campaign_oru4_prod', metadata: { Update_Technology: 'ORU4', Platform: 'MEB' } },
-    { name: 'dim_campaign_oru23' },
-    { name: 'dim_campaign_oru4_nar' },
-    { name: 'dim_campaign_orunext' },
-  ];
-  return queryTablesCombined(tables, limit);
+  return queryDimCampaignEUwithUSCANARCombined(limit);
 }
 
 async function queryDimCountryCombined(limit = 100) {
-  const tables = [
-    { name: 'dim_country_oru4_prod', metadata: { Update_Technology: 'ORU4', Platform: 'MEB' } },
-    { name: 'dim_country_oru23_dev' },
-    { name: 'dim_country_oru234chn_oru23nar' },
-    { name: 'dim_country_oru4_nar' },
-  ];
-  return queryTablesCombined(tables, limit);
+  return queryDimCountryEUwithUSCANARCombined(limit);
 }
 
 function normalizeFactCampaignKey(row) {
@@ -736,12 +705,27 @@ app.get("/api/dim_country_combined", async (req, res) => {
 // EU + US/CA + NAR/CH combined for dim_country
 async function queryDimCountryEUwithUSCANARCombined(limit = 100) {
   const tables = [
-    { name: 'dim_country_oru4_prod', metadata: { Update_Technology: 'ORU4', Platform: 'MEB' } },
-    { name: 'dim_country_oru23_prod', metadata: { Source: 'EU', Update_Technology: 'ORU23' } },
-    { name: 'dim_country_oru4_int', metadata: { Source: 'USCA', Update_Technology: 'ORU4' }, connectionHint: 'usca' },
-    { name: 'dim_country_oru234chn_oru23nar', metadata: { Source: 'NAR/CH' } },
+    { name: 'dim_country_oru4_prod', skipMetadata: true },
+    { name: 'dim_country_oru23_prod', metadata: { Source: 'EU' }, skipMetadata: true },
+    { name: 'dim_country_oru4_int', metadata: { Source: 'USCA' }, connectionHint: 'usca', skipMetadata: true },
+    { name: 'dim_country_oru234chn_oru23nar', metadata: { Source: 'NAR/CH' }, skipMetadata: true },
   ];
-  return queryTablesCombined(tables, limit);
+  const rows = await queryTablesCombined(tables, 0);
+  const filtered = rows.filter((row) => {
+    const name = row.country_name ?? row.country ?? '';
+    return name !== undefined && name !== null && String(name).trim() !== '';
+  });
+  const deduped = [];
+  const seen = new Set();
+  for (const row of filtered) {
+    const key = String(row.country_iso ?? row.iso ?? row.id ?? '').trim().toUpperCase();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    delete row.updated_technology;
+    delete row.platform;
+    deduped.push(row);
+  }
+  return limit && limit > 0 ? deduped.slice(0, limit) : deduped;
 }
 
 app.get("/api/dim_country_eu_usca_narch_combined", async (req, res) => {
