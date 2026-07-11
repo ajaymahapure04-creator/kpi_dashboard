@@ -3,6 +3,8 @@ import cors from "cors";
 import { DBSQLClient } from "@databricks/sql";
 import dotenv from "dotenv";
 import http from "http";
+import fs from "fs";
+import path from "path";
 import { createRequire } from "module";
 
 const require = createRequire(import.meta.url);
@@ -23,11 +25,116 @@ process.env.DATABRICKS_INT_PATH = process.env.DATABRICKS_INT_PATH || process.env
 process.env.DATABRICKS_INT_TOKEN = process.env.DATABRICKS_INT_TOKEN || process.env.DATABRICKS_TOKEN_USCA || process.env.DATABRICKS_TOKEN_INT;
 process.env.DATALAKE_INT_SCHEMA = process.env.DATALAKE_INT_SCHEMA || 'hive_metastore.datalake_int';
 
+// Local data mode: when no Databricks token is configured (or LOCAL_DATA=1),
+// serve rows from data/*.csv — dummy data from scripts/generate-mock-data.mjs
+// or real exports from scripts/export-combined-csv.js. LOCAL_DATA=0 forces off.
+const LOCAL_DATA_DIR = path.resolve(process.cwd(), 'data');
+// Assigning undefined to process.env (the default lines above) stores the
+// literal string "undefined", so treat that as an absent token here.
+const hasDatabricksToken = [process.env.DATABRICKS_TOKEN, process.env.DATABRICKS_INT_TOKEN]
+  .some((t) => t && t !== 'undefined');
+const LOCAL_DATA_MODE = process.env.LOCAL_DATA === '1'
+  || (process.env.LOCAL_DATA !== '0' && !hasDatabricksToken);
+
+function parseCsvText(text) {
+  const records = [];
+  let field = '';
+  let row = [];
+  let inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (text[i + 1] === '"') { field += '"'; i++; }
+        else inQuotes = false;
+      } else field += ch;
+    } else if (ch === '"') inQuotes = true;
+    else if (ch === ',') { row.push(field); field = ''; }
+    else if (ch === '\n' || ch === '\r') {
+      if (ch === '\r' && text[i + 1] === '\n') i++;
+      row.push(field); field = '';
+      records.push(row); row = [];
+    } else field += ch;
+  }
+  if (field !== '' || row.length) { row.push(field); records.push(row); }
+  if (records.length < 2) return [];
+  const headers = records[0];
+  return records.slice(1)
+    .filter((r) => r.some((v) => v !== ''))
+    .map((r) => {
+      const obj = {};
+      headers.forEach((h, idx) => {
+        const v = r[idx];
+        if (v !== undefined && v !== '') obj[h] = v;
+      });
+      return obj;
+    });
+}
+
+const localCsvCache = new Map();
+function loadLocalRows(name) {
+  if (localCsvCache.has(name)) return localCsvCache.get(name);
+  const filePath = path.join(LOCAL_DATA_DIR, `${name}.csv`);
+  let rows = null;
+  if (fs.existsSync(filePath)) rows = parseCsvText(fs.readFileSync(filePath, 'utf8'));
+  localCsvCache.set(name, rows);
+  return rows;
+}
+
+// Every API route maps onto one of the 8 canonical CSVs — each file is
+// already the full EU + US/CA + NAR/CN combination.
+const LOCAL_ENDPOINT_ALIASES = {
+  fact_main_oru4_prod: 'fact_main',
+  fact_main_combined: 'fact_main',
+  fact_main_eu_usca_combined: 'fact_main',
+  fact_adoption_rate_combined: 'fact_adoption_rate',
+  fact_adoption_rate_eu_usca_combined: 'fact_adoption_rate',
+  fact_ecu_combined: 'fact_ecu',
+  fact_ecu_eu_combined: 'fact_ecu',
+  fact_targeted_vehicles_combined: 'fact_targeted_vehicles',
+  fact_targeted_vehicles_eu_usca_combined: 'fact_targeted_vehicles',
+  fact_release_combined: 'fact_release',
+  fact_release_eu_usca_combined: 'fact_release',
+  dim_campaign_combined: 'dim_campaign',
+  dim_campaign_eu_usca_narch_combined: 'dim_campaign',
+  dim_country_combined: 'dim_country',
+  dim_country_eu_usca_narch_combined: 'dim_country',
+};
+
 const app = express();
-const port = process.env.PORT || 4000;
+const port = process.env.PORT || 5001;
 
 app.use(cors());
 app.use(express.json());
+
+// Lets the frontend show a Live/Local connection indicator without
+// guessing — reflects the mode decided once at process startup, not a
+// continuous health check (switching modes requires a backend restart).
+app.get('/api/status', (req, res) => {
+  res.json({ mode: LOCAL_DATA_MODE ? 'local' : 'live' });
+});
+
+if (LOCAL_DATA_MODE) {
+  console.log(`Local data mode: serving rows from ${LOCAL_DATA_DIR} (no Databricks connection). Run "node scripts/generate-mock-data.mjs" to (re)create dummy CSVs.`);
+  app.use('/api', (req, res, next) => {
+    const name = req.path.replace(/^\/+/, '');
+    if (name === 'table_counts') {
+      const counts = {};
+      const files = fs.existsSync(LOCAL_DATA_DIR) ? fs.readdirSync(LOCAL_DATA_DIR) : [];
+      for (const file of files) {
+        if (!file.endsWith('.csv')) continue;
+        const base = file.replace(/\.csv$/, '');
+        const rows = loadLocalRows(base) || [];
+        counts[base] = [{ table: base, row_count: rows.length }];
+      }
+      return res.json(counts);
+    }
+    const rows = loadLocalRows(LOCAL_ENDPOINT_ALIASES[name] || name);
+    if (!rows) return next();
+    const limit = Math.min(5000, Number(req.query.limit) || 1000);
+    return res.json(rows.slice(0, limit));
+  });
+}
 
 // In-memory cache and SSE clients for live updates
 // Default refresh every 15s for more responsive dashboards (can override with env)
@@ -63,6 +170,18 @@ function broadcastWebSocket(payloadObj) {
 }
 
 async function refreshFactMainCache() {
+  if (LOCAL_DATA_MODE) {
+    // Seed the cache once from the local CSV so the SSE/WebSocket snapshot
+    // path works without Databricks; no periodic refresh needed.
+    if (cache.fact_main.rows && cache.fact_main.rows.length) return;
+    const rows = loadLocalRows('fact_main') || [];
+    cache.fact_main.rows = rows;
+    cache.fact_main.updatedAt = Date.now();
+    const payload = { full: true, rows, updatedAt: cache.fact_main.updatedAt };
+    broadcastFactMainUpdate(payload);
+    broadcastWebSocket(payload);
+    return;
+  }
   try {
     const rows = await queryFactMainCombined(1000);
     const now = Date.now();
@@ -184,9 +303,12 @@ function buildTableName(schema, name) {
 }
 
 function getTableCandidates() {
+  // The USCA workspace exposes *_prod tables in datalake_prod and *_int
+  // tables in datalake_int, so the usca connection must probe both schemas.
   return [
     { schema: PROD_SCHEMA, connection: 'prod' },
     { schema: PROD_SCHEMA, connection: 'usca' },
+    { schema: INT_SCHEMA, connection: 'usca' },
     { schema: INT_SCHEMA, connection: 'int' },
     { schema: DEV_SCHEMA, connection: 'int' },
   ];
@@ -250,15 +372,16 @@ function transformRow(row) {
 }
 
 function makeRowId(row) {
-  // Prefer `campaign` as the stable identifier. Fall back to a composite
-  // key if `campaign` is not present.
+  // Row grain is campaign × country × date; all three must be in the key or
+  // rows of the same campaign collapse into one entry in delta maps.
   const campaign = (row.campaign || row.Campaign || row.campaign_id || row.id || row.name || "").toString();
-  if (campaign) return `campaign:${campaign}`;
   const country = (row.country_iso || row.iso || row.country || "").toString();
+  const date = (row.date || row.Date || "").toString();
+  if (campaign) return `campaign:${campaign}|${country}|${date}`;
   const recall = (row.recall || row.Recall || row.recall_id || row.Recall_ID || "").toString();
   const tech = (row.updated_technology || row.Update_Technology || row.update_technology || "").toString();
   const platform = (row.platform || row.Platform || "").toString();
-  return `fallback:${country}||${recall}||${tech}||${platform}`;
+  return `fallback:${country}||${recall}||${tech}||${platform}||${date}`;
 }
 
 async function queryTablesCombined(tableConfigs, limit = 100) {
@@ -328,12 +451,15 @@ async function queryFactMainCombined(limit = 100, skipEnrich = false) {
 
 async function queryFactMainEUwithUSCACombined(limit = 100) {
   const tables = [
-    { name: 'fact_main_oru23', metadata: { Source: 'EU' } },
-    { name: 'fact_main_oru234chn_oru23nar', metadata: { Source: 'EU' } },
-    { name: 'fact_main_oru4_nar', metadata: { Source: 'EU' } },
-    { name: 'fact_main_orunext', metadata: { Source: 'EU' } },
-    { name: 'fact_main_oru4_prod', metadata: { Update_Technology: 'ORU4', Platform: 'USCA' }, connectionHint: 'usca' },
-    { name: 'fact_main_oru4_int', metadata: { Source: 'USCA', Update_Technology: 'ORU4' }, connectionHint: 'usca' },
+    // EU: ORU4 + ORU23 (+ ORUnext)
+    { name: 'fact_main_oru4_prod', metadata: { Source: 'EU', Update_Technology: 'ORU4', Platform: 'MEB' }, connectionHint: 'prod' },
+    { name: 'fact_main_oru23_prod', metadata: { Source: 'EU', Update_Technology: 'ORU23', Platform: 'MQB/MLB' } },
+    { name: 'fact_main_orunext', metadata: { Source: 'EU', Update_Technology: 'ORUnext' } },
+    // NAR/CN: ORU4 + ORU23
+    { name: 'fact_main_oru4_nar', metadata: { Source: 'NAR/CN', Update_Technology: 'ORU4', Platform: 'MEB' } },
+    { name: 'fact_main_oru234chn_oru23nar', metadata: { Source: 'NAR/CN' } },
+    // US/CA: ORU4
+    { name: 'fact_main_oru4_int', metadata: { Source: 'USCA', Update_Technology: 'ORU4', Platform: 'MEB' }, connectionHint: 'usca' },
   ];
   return queryTablesCombined(tables, limit);
 }
@@ -412,9 +538,9 @@ app.get('/events/fact_main', (req, res) => {
   });
   res.write('retry: 3000\n\n');
 
-  // send initial snapshot
+  // send initial snapshot (full flag tells clients to replace, not merge)
   if (cache.fact_main && cache.fact_main.rows) {
-    const payload = JSON.stringify({ rows: cache.fact_main.rows, updatedAt: cache.fact_main.updatedAt });
+    const payload = JSON.stringify({ full: true, rows: cache.fact_main.rows, updatedAt: cache.fact_main.updatedAt });
     res.write(`data: ${payload}\n\n`);
   }
 
@@ -435,8 +561,9 @@ async function queryFactAdoptionRateCombined(limit = 100) {
 
 async function queryFactAdoptionRateEUwithUSCACombined(limit = 100) {
   const tables = [
-    { name: 'fact_adoption_rate_oru4_prod', metadata: { Update_Technology: 'ORU4', Platform: 'MEB' } },
+    { name: 'fact_adoption_rate_oru4_prod', metadata: { Source: 'EU', Update_Technology: 'ORU4', Platform: 'MEB' } },
     { name: 'fact_adoption_rate_oru23', metadata: { Source: 'EU' } },
+    { name: 'fact_adoption_rate_oru4_nar', metadata: { Source: 'NAR/CN', Update_Technology: 'ORU4' } },
     { name: 'fact_adoption_rate_oru4_int', metadata: { Source: 'USCA', Update_Technology: 'ORU4' }, connectionHint: 'usca' },
   ];
   return queryTablesCombined(tables, limit);
@@ -444,8 +571,8 @@ async function queryFactAdoptionRateEUwithUSCACombined(limit = 100) {
 
 async function queryFactEcuCombined(limit = 100) {
   const tables = [
-    { name: 'fact_ecu_oru4_prod', metadata: { Update_Technology: 'ORU4', Platform: 'MEB' } },
-    { name: 'fact_ecu_oru23' },
+    { name: 'fact_ecu_oru4_prod', metadata: { Source: 'EU', Update_Technology: 'ORU4', Platform: 'MEB' } },
+    { name: 'fact_ecu_oru23', metadata: { Source: 'EU' } },
   ];
   return queryTablesCombined(tables, limit);
 }
@@ -453,7 +580,7 @@ async function queryFactEcuCombined(limit = 100) {
 // EU-specific ECU combined query: prefer prod-suffixed EU sources
 async function queryFactEcuEUCombined(limit = 100) {
   const tables = [
-    { name: 'fact_ecu_oru4_prod', metadata: { Update_Technology: 'ORU4', Platform: 'MEB' } },
+    { name: 'fact_ecu_oru4_prod', metadata: { Source: 'EU', Update_Technology: 'ORU4', Platform: 'MEB' } },
     { name: 'fact_ecu_oru23_prod', metadata: { Source: 'EU' } },
   ];
   return queryTablesCombined(tables, limit);
@@ -483,7 +610,9 @@ function buildFactCampaignLookup(rows) {
     lookup.set(campaign, {
       brand: row.brand || row.Brand || undefined,
       platform: row.platform || row.Platform || undefined,
-      recall: row.recall || row.Recall || row.recall_id || row.Recall_ID || undefined,
+      // recall_id is the campaign column itself unless an explicit
+      // recall/recall_id column exists — each campaign IS a recall.
+      recall: row.recall || row.Recall || row.recall_id || row.Recall_ID || campaign,
     });
   }
   return lookup;
@@ -586,7 +715,7 @@ app.get("/api/fact_ecu_eu_combined", async (req, res) => {
 // EU + US/CA combined for fact_frequency
 async function queryFactFrequencyEUwithUSCACombined(limit = 100) {
   const tables = [
-    { name: 'fact_frequency_oru4_prod', metadata: { Update_Technology: 'ORU4', Platform: 'MEB' } },
+    { name: 'fact_frequency_oru4_prod', metadata: { Source: 'EU', Update_Technology: 'ORU4', Platform: 'MEB' } },
     { name: 'fact_frequency_oru23_prod', metadata: { Source: 'EU' } },
     { name: 'fact_frequency_oru4_int', metadata: { Source: 'USCA', Update_Technology: 'ORU4' }, connectionHint: 'usca' },
   ];
@@ -668,14 +797,14 @@ app.get("/api/dim_campaign_combined", async (req, res) => {
   }
 });
 
-// EU + US/CA + NAR/CH combined for dim_campaign
+// EU + US/CA + NAR/CN combined for dim_campaign
 async function queryDimCampaignEUwithUSCANARCombined(limit = 100) {
   const tables = [
     { name: 'dim_campaign_oru4_prod', metadata: { Update_Technology: 'ORU4', Platform: 'MEB' } },
     { name: 'dim_campaign_oru23_prod', metadata: { Source: 'EU', Update_Technology: 'ORU23' } },
     { name: 'dim_campaign_orunext', metadata: { Source: 'EU' } },
     { name: 'dim_campaign_oru4_int', metadata: { Source: 'USCA', Update_Technology: 'ORU4' }, connectionHint: 'usca' },
-    { name: 'dim_campaign_oru234chn_oru23nar', metadata: { Source: 'NAR/CH' } },
+    { name: 'dim_campaign_oru234chn_oru23nar', metadata: { Source: 'NAR/CN' } },
   ];
   return queryTablesCombined(tables, limit);
 }
@@ -702,13 +831,13 @@ app.get("/api/dim_country_combined", async (req, res) => {
   }
 });
 
-// EU + US/CA + NAR/CH combined for dim_country
+// EU + US/CA + NAR/CN combined for dim_country
 async function queryDimCountryEUwithUSCANARCombined(limit = 100) {
   const tables = [
     { name: 'dim_country_oru4_prod', skipMetadata: true },
     { name: 'dim_country_oru23_prod', metadata: { Source: 'EU' }, skipMetadata: true },
     { name: 'dim_country_oru4_int', metadata: { Source: 'USCA' }, connectionHint: 'usca', skipMetadata: true },
-    { name: 'dim_country_oru234chn_oru23nar', metadata: { Source: 'NAR/CH' }, skipMetadata: true },
+    { name: 'dim_country_oru234chn_oru23nar', metadata: { Source: 'NAR/CN' }, skipMetadata: true },
   ];
   const rows = await queryTablesCombined(tables, 0);
   const filtered = rows.filter((row) => {

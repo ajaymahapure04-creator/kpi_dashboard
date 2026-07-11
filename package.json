@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "backend": "node server.js",
     "dev:backend": "node server.js",
-    "dev-all": "node scripts/start-dev.js"
+    "dev-all": "node scripts/start-dev.js",
+    "mock-data": "node scripts/generate-mock-data.mjs"
   },
   "dependencies": {
     "@databricks/sql": "^1.16.0",

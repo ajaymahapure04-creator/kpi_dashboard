@@ -99,7 +99,7 @@ const RECALL_SHARE = { "R-2214": 0.04, "R-2260": 0.03, "R-2301": 0.02 };
 
 // Empty array = "All" (no constraint on that dimension)
 const DEFAULT_FILTERS = {
-  region: [], brand: [], platform: [], recall: [],
+  region: [], country: [], brand: [], platform: [], recall: [],
   from: "2021-01-01", to: "2026-07-07",
 };
 
@@ -124,18 +124,22 @@ function normalizePlatformValue(row) {
 }
 
 function normalizeRecallValue(row) {
-  return row.recall || row.Recall || row.recall_id || row.Recall_ID || "";
+  // recall_id is the campaign column itself (dim_campaign.campaign) unless
+  // an explicit recall/recall_id column is present — each campaign IS a recall.
+  return row.recall || row.Recall || row.recall_id || row.Recall_ID || normalizeCampaignValue(row);
 }
 
 function makeRowId(row) {
-  // Prefer campaign as the stable identifier; fall back to composite if missing.
+  // Row grain is campaign × country × date; all three must be in the key or
+  // rows of the same campaign collapse into one entry when merging deltas.
   const campaign = (row.campaign || row.Campaign || row.campaign_id || row.id || row.name || "").toString();
-  if (campaign) return `campaign:${campaign}`;
   const country = (row.country_iso || row.iso || row.country || "").toString();
+  const date = (row.date || row.Date || "").toString();
+  if (campaign) return `campaign:${campaign}|${country}|${date}`;
   const recall = (row.recall || row.Recall || row.recall_id || row.Recall_ID || "").toString();
   const tech = (row.updated_technology || row.Update_Technology || row.update_technology || "").toString();
   const platform = (row.platform || row.Platform || "").toString();
-  return `fallback:${country}||${recall}||${tech}||${platform}`;
+  return `fallback:${country}||${recall}||${tech}||${platform}||${date}`;
 }
 
 function buildCountryLookup(rows) {
@@ -169,71 +173,81 @@ function uniqueDimValues(rows, getter) {
   return [...new Set(rows.map(getter).filter(Boolean))].sort();
 }
 
-function matchesRowFilters(row, filters, countryLookup, campaignLookup) {
-  const rowCampaign = normalizeCampaignValue(row);
-  const campaign = campaignLookup.get(rowCampaign) || {};
-  const rowBrand = row.brand || row.Brand || campaign.brand || "";
-  const rowPlatform = row.platform || row.Platform || campaign.platform || "";
-  const rowRecall = row.recall || row.Recall || campaign.recall || rowCampaign;
-  const lookup = countryLookup.get(row.country_iso || row.country || row.iso || "") || {};
-  const rowRegion = lookup.region || row.region || row.Region || "";
+// Every fact table joins to dim_campaign via `campaign` and to dim_country
+// via `country_iso` — those are the two primary keys. This resolves a raw
+// fact row's brand/platform/recall_id (from dim_campaign) and country_name/
+// region (from dim_country) once, so every downstream consumer (filtering,
+// cascading, breakdown charts) can read plain fields instead of re-joining.
+function enrichRow(row, campaignLookup, countryLookup) {
+  const campaign = normalizeCampaignValue(row);
+  const dimCampaign = campaignLookup.get(campaign) || {};
+  const countryIso = row.country_iso ?? row.country ?? row.iso ?? "";
+  const dimCountry = countryLookup.get(countryIso) || {};
+  return {
+    ...row,
+    brand: row.brand || row.Brand || dimCampaign.brand || "",
+    platform: row.platform || row.Platform || dimCampaign.platform || "",
+    recall: row.recall || row.Recall || dimCampaign.recall || campaign,
+    country_name: dimCountry.country || row.country_name || row.country || "",
+    region: dimCountry.region || row.region || row.Region || "",
+  };
+}
 
-  if (filters.brand.length && !filters.brand.includes(rowBrand)) return false;
-  if (filters.platform.length && !filters.platform.includes(rowPlatform)) return false;
-  if (filters.recall.length && !rowRecall) return false;
-  if (filters.recall.length && !filters.recall.includes(rowRecall)) return false;
-  if (filters.region.length && !filters.region.includes(rowRegion)) return false;
+// filters.from/filters.to bound whichever date-like column a row carries
+// (fact_main/fact_adoption_rate use `date`, fact_release uses `rollout_start`).
+// Rows without any date column are never excluded by the date filter.
+function dateInRange(row, filters) {
+  const raw = row.date ?? row.Date ?? row.rollout_start;
+  if (!raw) return true;
+  const d = new Date(raw);
+  if (Number.isNaN(d.valueOf())) return true;
+  if (filters.from && d < new Date(filters.from + "T00:00:00")) return false;
+  if (filters.to && d > new Date(filters.to + "T23:59:59")) return false;
   return true;
 }
 
-function getAvailableDimensionOptions(filters, campaignRows, countryRows) {
-  const available = {
-    region: new Set(),
-    brand: new Set(),
-    platform: new Set(),
-    recall: new Set(),
-  };
+// Rows must already be enriched (see enrichRow) so brand/platform/recall/
+// country_name/region are plain fields here.
+function matchesRowFilters(row, filters) {
+  if (filters.brand.length && !filters.brand.includes(row.brand)) return false;
+  if (filters.platform.length && !filters.platform.includes(row.platform)) return false;
+  if (filters.recall.length && !filters.recall.includes(row.recall)) return false;
+  if (filters.region.length && !filters.region.includes(row.region)) return false;
+  if (filters.country.length && !filters.country.includes(row.country_name)) return false;
+  if (!dateInRange(row, filters)) return false;
+  return true;
+}
 
-  for (const row of campaignRows) {
-    const rowRegion = normalizeRegionValue(row);
-    const rowBrand = normalizeBrandValue(row);
-    const rowPlatform = normalizePlatformValue(row);
-    const rowRecall = normalizeRecallValue(row);
+const FILTER_DIMS = ["region", "country", "brand", "platform", "recall"];
+const FIELD_FOR_DIM = { region: "region", country: "country_name", brand: "brand", platform: "platform", recall: "recall" };
 
-    if (filters.region.length && !filters.region.includes(rowRegion)) continue;
-    if (filters.brand.length && !filters.brand.includes(rowBrand)) continue;
-    if (filters.platform.length && !filters.platform.includes(rowPlatform)) continue;
-    if (filters.recall.length && !filters.recall.includes(rowRecall)) continue;
-
-    if (rowBrand) available.brand.add(rowBrand);
-    if (rowPlatform) available.platform.add(rowPlatform);
-    if (rowRecall) available.recall.add(rowRecall);
-    if (rowRegion) available.region.add(rowRegion);
-  }
-
-  if (!filters.brand.length && !filters.platform.length && !filters.recall.length) {
-    for (const row of countryRows) {
-      const region = normalizeRegionValue(row);
-      if (region) available.region.add(region);
+// Cascading (cross-filter) availability, computed from enriched FACT rows —
+// the fact table is the only place `campaign` and `country_iso` appear
+// together, so it's the only place that can answer "which regions/countries
+// does this brand actually ship to" and vice versa. A dimension's own
+// options are computed from the OTHER active filters only, never from its
+// own current selection — otherwise picking one Brand would filter every
+// row down to that brand and lock out every other brand checkbox, making
+// multi-select within a dimension impossible.
+function getAvailableDimensionOptions(filters, enrichedRows) {
+  const available = Object.fromEntries(FILTER_DIMS.map((d) => [d, new Set()]));
+  for (const row of enrichedRows) {
+    for (const dim of FILTER_DIMS) {
+      const matchesOthers = FILTER_DIMS.every((otherDim) => {
+        if (otherDim === dim) return true;
+        const sel = filters[otherDim];
+        return !sel.length || sel.includes(row[FIELD_FOR_DIM[otherDim]]);
+      });
+      const v = row[FIELD_FOR_DIM[dim]];
+      if (matchesOthers && v) available[dim].add(v);
     }
   }
-
-  if (!campaignRows.length) {
-    for (const row of countryRows) {
-      const region = normalizeRegionValue(row);
-      if (region) available.region.add(region);
-    }
-  }
-
   return available;
 }
 
 function cascadeFilters(filters, available) {
   const out = { ...filters };
-  out.brand = out.brand.filter((v) => available.brand.has(v));
-  out.platform = out.platform.filter((v) => available.platform.has(v));
-  out.recall = out.recall.filter((v) => available.recall.has(v));
-  out.region = out.region.filter((v) => available.region.has(v));
+  for (const dim of FILTER_DIMS) out[dim] = out[dim].filter((v) => available[dim].has(v));
   return out;
 }
 
@@ -246,12 +260,14 @@ function filterScope(filters) {
   const active = [
     ...filters.brand,
     ...filters.region,
+    ...filters.country,
     ...filters.platform,
     ...filters.recall,
   ];
   const scale =
     sumShare(filters.brand, BRAND_SHARE) *
     sumShare(filters.region, REGION_SHARE) *
+    sumShare(filters.country, {}) *
     sumShare(filters.platform, PLATFORM_SHARE) *
     sumShare(filters.recall, RECALL_SHARE);
   const seedShift = active.join("").split("").reduce((a, c) => a + c.charCodeAt(0), 0) % 89 * 0.37;
@@ -272,31 +288,6 @@ function scaleMagnitude(str, scale) {
   else if (abs >= 1e3) out = (abs / 1e3).toFixed(1) + "K";
   else out = abs.toFixed(abs < 10 ? 1 : 0);
   return m[1] + out;
-}
-
-// deterministic pseudo-random series so the demo is stable
-function genSeries(seed, base, vol, days, drift = 0, endDate = "2026-07-07") {
-  const out = [];
-  let v = base;
-  const end = new Date(endDate + "T00:00:00");
-  for (let i = 0; i < days; i++) {
-    const n = Math.sin(seed * 3.7 + i * 1.31) * 0.5 + Math.sin(seed + i * 0.37) * 0.5;
-    v = Math.max(0, v + n * vol + drift);
-    const d = new Date(end);
-    d.setDate(end.getDate() - (days - 1 - i));
-    out.push({
-      date: d.toLocaleDateString("en-GB", { day: "2-digit", month: "short" }),
-      value: +v.toFixed(2),
-    });
-  }
-  return out;
-}
-
-function genBreakdown(seed, keys, base) {
-  return keys.map((k, i) => ({
-    name: k,
-    value: +(base * (0.4 + Math.abs(Math.sin(seed * 2.1 + i * 1.7)) * 1.2)).toFixed(1),
-  }));
 }
 
 /* ------------------------------------------------------------------ */
@@ -321,6 +312,44 @@ function adoptionCurve(release, days = 42) {
     out.push(+Math.max(0, v).toFixed(1));
   }
   return out;
+}
+
+// Map backend fact_release rows onto the release-register shape; the static
+// RELEASES scaffold is only used when the backend has no release data.
+function releasesFromRows(rows) {
+  if (!Array.isArray(rows) || !rows.length) return RELEASES;
+  const seen = new Set();
+  const out = [];
+  for (const r of rows) {
+    const id = String(r.release ?? r.version ?? "").trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push({
+      id,
+      campaign: r.campaign,
+      date: String(r.rollout_start ?? r.date ?? ""),
+      vehiclesM: (Number(r.vehicles ?? 0) || 0) / 1e6,
+      success: Number(r.success_rate ?? r.success ?? 0) || 0,
+      errPer1k: Number(r.err_per_1k ?? r.errPer1k ?? 0) || 0,
+      avgMin: Number(r.avg_duration_min ?? r.avgMin ?? 0) || 0,
+      rollout: Number(r.rollout_pct ?? r.rollout ?? 0) || 0,
+    });
+  }
+  return out.length ? out : RELEASES;
+}
+
+// Adoption ramp for a release from backend fact_adoption_rate rows; falls
+// back to the synthetic curve only for the static scaffold entries (which
+// carry adoptionCap/tau), otherwise an empty series.
+function adoptionSeriesFor(release, adoptionRows) {
+  const rows = (adoptionRows || []).filter((r) => release.campaign && (r.campaign ?? "") === release.campaign);
+  if (rows.length) {
+    return rows
+      .slice()
+      .sort((a, b) => String(a.date).localeCompare(String(b.date)))
+      .map((r) => Number(r.adoption_rate) || 0);
+  }
+  return release.adoptionCap != null ? adoptionCurve(release) : [];
 }
 
 /* ------------------------------------------------------------------ */
@@ -446,6 +475,48 @@ const KPIS = [
   },
 ];
 
+// Maps each KPI to the fact_ai_summaries_facts_v3_int.metric_domains value
+// it corresponds to, so the AI Insights panel can prioritize the summary
+// row that's actually about the KPI being viewed. Casing matches the real
+// export (`Co2_savings` is capitalized there; the rest are snake_case).
+const KPI_METRIC_DOMAIN = {
+  updates: "successful_updates",
+  quality: "quality",
+  liegenbleiber: "liegenbleiber",
+  adoption: "adoption_rate",
+  duration: "installation_duration",
+  cost: "cost_savings",
+  co2: "Co2_savings",
+};
+
+// Summaries for this KPI whose brand/platform/region are compatible with
+// the currently active filters. An unset filter dimension imposes no
+// constraint; a summary's region: "ALL" always counts as a match since that
+// value means "not region-scoped". Returns [] rather than falling back to
+// an unrelated summary — a mismatched filter selection should show nothing,
+// not a misleading insight for a different scope.
+function summariesMatchingScope(aiSummaries, kpiId, filters) {
+  if (!aiSummaries || !aiSummaries.length) return [];
+  const domain = (KPI_METRIC_DOMAIN[kpiId] || "").toLowerCase();
+  return aiSummaries
+    .filter((s) => {
+      if ((s.metric_domains || "").toLowerCase() !== domain) return false;
+      if (filters.region.length && s.region !== "ALL" && !filters.region.includes(s.region)) return false;
+      if (filters.brand.length && !filters.brand.includes(s.brand)) return false;
+      if (filters.platform.length && !filters.platform.includes(s.platform)) return false;
+      return true;
+    })
+    .sort((a, b) => (Number(a.rank) || 99) - (Number(b.rank) || 99));
+}
+
+// Matches the static registry's scope-label style ("Region: Europe | Brand:
+// MAN | Platform: MQB/MLB") so live and fallback insight meta lines read the
+// same — Region/Brand/Platform only, nothing else.
+function formatInsightMeta(s) {
+  const region = s.region === "ALL" ? "All regions" : s.region;
+  return `Region: ${region} | Brand: ${s.brand} | Platform: ${s.platform}`;
+}
+
 const deltaColor = (raw, goodWhen) => {
   const num = parseFloat(String(raw).replace(/[^\d.-]/g, ""));
   if (!num) return C.bad; // flat deltas render red, matching the source Power BI dashboard
@@ -547,10 +618,60 @@ function formatKpiValue(value, kpiId) {
   }
 }
 
+function formatKpiDelta(delta, kpiId) {
+  if (delta == null || Number.isNaN(delta)) return null;
+  const sign = delta < 0 ? "-" : "+";
+  const abs = Math.abs(delta);
+  switch (kpiId) {
+    case "updates":
+    case "cost":
+    case "co2":
+      return `${sign}${formatLargeNumber(abs)}`;
+    case "adoption":
+      return `${sign}${abs.toFixed(1)}%`;
+    default:
+      return `${sign}${abs.toFixed(1)}`;
+  }
+}
+
+// KPI change over the trailing window vs the window before it.
+function deltaForKpi(rows, kpiId, days) {
+  if (!rows || !rows.length) return null;
+  const DAY = 24 * 60 * 60 * 1000;
+  const dated = [];
+  for (const row of rows) {
+    const raw = row.date ?? row.Date;
+    const parsed = raw ? new Date(raw) : null;
+    if (parsed && !Number.isNaN(parsed.valueOf())) dated.push({ row, time: parsed.valueOf() });
+  }
+  if (!dated.length) return null;
+  const end = Math.max(...dated.map((d) => d.time));
+  const currStart = end - days * DAY;
+  const prevStart = end - 2 * days * DAY;
+  const curr = dated.filter((d) => d.time > currStart).map((d) => d.row);
+  const prev = dated.filter((d) => d.time > prevStart && d.time <= currStart).map((d) => d.row);
+  if (!curr.length || !prev.length) return null;
+  const a = valueForKpi(curr, kpiId);
+  const b = valueForKpi(prev, kpiId);
+  if (a == null || b == null) return null;
+  return a - b;
+}
+
 function runtimeKpi(kpi, rows, scope) {
   const actualValue = valueForKpi(rows, kpi.id);
+  // No usable backend data: fall back to the static registry values, scaled
+  // by the fleet-share approximation.
   if (actualValue == null) return scopedKpi(kpi, scope);
-  return scopedKpi({ ...kpi, value: formatKpiValue(actualValue, kpi.id) }, scope);
+  // Live values are computed from already-filtered rows — applying the
+  // fleet-share scaling on top would double-count the filter.
+  const d7 = formatKpiDelta(deltaForKpi(rows, kpi.id, 7), kpi.id);
+  const d30 = formatKpiDelta(deltaForKpi(rows, kpi.id, 30), kpi.id);
+  return {
+    ...kpi,
+    value: formatKpiValue(actualValue, kpi.id),
+    d7: d7 ?? kpi.d7,
+    d30: d30 ?? kpi.d30,
+  };
 }
 
 function buildKpiSeries(rows, kpiId, range) {
@@ -617,7 +738,7 @@ function ThemeToggle({ theme, onToggle }) {
   );
 }
 
-function TopBar({ theme, onToggleTheme, navOpen, onToggleNav, backendStatus }) {
+function TopBar({ theme, onToggleTheme, navOpen, onToggleNav }) {
   return (
     <div
       className="flex items-center justify-between px-4 py-2 shrink-0"
@@ -658,7 +779,27 @@ function TopBar({ theme, onToggleTheme, navOpen, onToggleNav, backendStatus }) {
 const NAV_ORDER = ["updates", "co2", "cost", "adoption", "quality", "liegenbleiber", "duration"];
 const NAV_WIDTH = 230;
 
-function SideNav({ open, onClose, route, onNavigate, backendStatus }) {
+// Blinking green dot + "Live" when the backend is querying Databricks;
+// a static dot + "Connected — Local data" when it's serving data/*.csv.
+function ConnectionStatus({ loading, error, dataMode }) {
+  if (loading) return <span className="text-xs" style={{ color: C.dim }}>Loading backend…</span>;
+  if (error) return <span className="text-xs truncate" style={{ color: C.bad }}>Backend error: {error}</span>;
+  if (!dataMode) return null;
+  const isLive = dataMode === "live";
+  return (
+    <div className="flex items-center gap-2 min-w-0">
+      <span
+        className={isLive ? "animate-pulse" : ""}
+        style={{ width: 8, height: 8, borderRadius: 9999, background: isLive ? C.good : C.accent, flexShrink: 0 }}
+      />
+      <span className="text-xs truncate" style={{ color: C.dim }}>
+        {isLive ? "Live" : "Connected — Local data"}
+      </span>
+    </div>
+  );
+}
+
+function SideNav({ open, onClose, route, onNavigate, backendLoading, backendError, dataMode }) {
   const activeId = route.page === "detail" ? route.kpiId : null;
   const item = (active, onClick, icon, label, key) => (
     <button
@@ -698,7 +839,7 @@ function SideNav({ open, onClose, route, onNavigate, backendStatus }) {
           })}
         </div>
         <div className="px-3 py-2 shrink-0" style={{ borderTop: `1px solid ${C.cardBorderSoft}`, background: C.panel }}>
-          <span className="text-xs" style={{ color: C.dim }}>{backendStatus}</span>
+          <ConnectionStatus loading={backendLoading} error={backendError} dataMode={dataMode} />
         </div>
       </div>
     </div>
@@ -822,6 +963,133 @@ function MultiSelect({ label, values, options, onChange }) {
   );
 }
 
+/* Region filter with countries nested inside, each region expandable to
+   reveal its countries (Power BI hierarchy-slicer style). The region
+   checkbox drives `filters.region`; a country checkbox under an expanded
+   region drives `filters.country` independently — you don't need to check
+   the region to pick one of its countries. */
+function RegionCountryFilter({ label, regionValues, countryValues, regionCountryMap, regionAvailable, countryAvailable, onRegionChange, onCountryChange }) {
+  const [open, setOpen] = useState(false);
+  const [expanded, setExpanded] = useState(() => new Set());
+  const ref = useRef(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [open]);
+
+  const toggleRegion = (r) => onRegionChange(regionValues.includes(r) ? regionValues.filter((x) => x !== r) : [...regionValues, r]);
+  const toggleCountry = (c) => onCountryChange(countryValues.includes(c) ? countryValues.filter((x) => x !== c) : [...countryValues, c]);
+  const toggleExpand = (r) => setExpanded((prev) => {
+    const next = new Set(prev);
+    if (next.has(r)) next.delete(r); else next.add(r);
+    return next;
+  });
+
+  const regions = [...regionCountryMap.keys()].sort();
+  const summaryParts = [];
+  if (regionValues.length) summaryParts.push(regionValues.length <= 2 ? regionValues.join(", ") : `${regionValues.length} regions`);
+  if (countryValues.length) summaryParts.push(countryValues.length <= 2 ? countryValues.join(", ") : `${countryValues.length} countries`);
+  const summary = summaryParts.length ? summaryParts.join(" · ") : "All";
+
+  return (
+    <div className="flex flex-col gap-1 min-w-0 relative" ref={ref}>
+      <label className="text-xs font-semibold" style={{ color: C.dim }}>{label}</label>
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        className="rounded px-2 py-1.5 text-sm w-full flex items-center justify-between gap-1"
+        style={{ background: C.inputBg, color: C.text, border: `1px solid ${open ? C.accent : C.cardBorderSoft}` }}
+      >
+        <span className="truncate">{summary}</span>
+        <ChevronRight size={13} style={{ transform: `rotate(${open ? -90 : 90}deg)`, flexShrink: 0 }} color={C.dim} />
+      </button>
+      {open && (
+        <div
+          className="absolute left-0 right-0 rounded-lg py-1 z-50 shadow-xl overflow-y-auto"
+          style={{ top: "100%", marginTop: 4, background: C.tooltipBg, border: `1px solid ${C.cardBorder}`, minWidth: 220, maxHeight: 320 }}
+        >
+          <button
+            type="button"
+            onClick={() => { onRegionChange([]); onCountryChange([]); setOpen(false); }}
+            className="w-full text-left px-2 py-1 text-xs font-semibold hover:opacity-80"
+            style={{ color: C.accent }}
+          >
+            All ({label})
+          </button>
+          {regions.map((region) => {
+            const countries = regionCountryMap.get(region) || [];
+            const regionEnabled = regionAvailable.has(region);
+            const isExpanded = expanded.has(region);
+            return (
+              <div key={region}>
+                <div className="flex items-center gap-1 px-1 py-0.5">
+                  <button
+                    type="button"
+                    onClick={() => toggleExpand(region)}
+                    className="p-0.5 rounded hover:opacity-70 shrink-0"
+                    style={{ color: C.dim }}
+                    aria-label={isExpanded ? `Collapse ${region}` : `Expand ${region}`}
+                    aria-expanded={isExpanded}
+                  >
+                    <ChevronRight size={12} style={{ transform: `rotate(${isExpanded ? 90 : 0}deg)`, transition: "transform 0.15s" }} />
+                  </button>
+                  <label
+                    className="flex items-center gap-2 px-1 py-0.5 text-sm flex-1 min-w-0"
+                    style={{
+                      color: regionEnabled ? C.text : C.disabledText,
+                      opacity: regionEnabled ? 1 : 0.55,
+                      cursor: regionEnabled ? "pointer" : "not-allowed",
+                    }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={regionValues.includes(region)}
+                      disabled={!regionEnabled}
+                      onChange={() => toggleRegion(region)}
+                      style={{ accentColor: C.accent }}
+                    />
+                    <span className="truncate">{region}</span>
+                  </label>
+                </div>
+                {isExpanded && (
+                  <div className="flex flex-col" style={{ marginLeft: 26 }}>
+                    {countries.map((country) => {
+                      const countryEnabled = countryAvailable.has(country);
+                      return (
+                        <label
+                          key={country}
+                          className="flex items-center gap-2 px-2 py-0.5 text-sm"
+                          style={{
+                            color: countryEnabled ? C.text : C.disabledText,
+                            opacity: countryEnabled ? 1 : 0.55,
+                            cursor: countryEnabled ? "pointer" : "not-allowed",
+                          }}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={countryValues.includes(country)}
+                            disabled={!countryEnabled}
+                            onChange={() => toggleCountry(country)}
+                            style={{ accentColor: C.accent }}
+                          />
+                          <span className="truncate">{country}</span>
+                        </label>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function Select({ label, value, options, onChange }) {
   return (
     <div className="flex flex-col gap-1 min-w-0">
@@ -839,13 +1107,13 @@ function Select({ label, value, options, onChange }) {
   );
 }
 
-function FilterBar({ filters, setFilters, regionOptions, brandOptions, platformOptions, recallOptions, campaignRows, countryRows }) {
-  const available = getAvailableDimensionOptions(filters, campaignRows, countryRows);
+function FilterBar({ filters, setFilters, regionCountryMap, brandOptions, platformOptions, recallOptions, enrichedRows }) {
+  const available = getAvailableDimensionOptions(filters, enrichedRows);
   const set = (k) => (v) => setFilters((f) => ({ ...f, [k]: v }));
   // A change in one dimension re-cascades the others using actual dimension availability.
   const setDim = (dim) => (vals) => setFilters((f) => {
     const next = { ...f, [dim]: vals };
-    const nextAvailable = getAvailableDimensionOptions(next, campaignRows, countryRows);
+    const nextAvailable = getAvailableDimensionOptions(next, enrichedRows);
     return cascadeFilters(next, nextAvailable);
   });
   const reset = () => setFilters(DEFAULT_FILTERS);
@@ -858,7 +1126,16 @@ function FilterBar({ filters, setFilters, regionOptions, brandOptions, platformO
     >
       <VLabel>SCOPE</VLabel>
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3 flex-1 min-w-0" style={{ maxWidth: 960 }}>
-        <MultiSelect label="Region" values={filters.region} options={optsFor("region", regionOptions)} onChange={setDim("region")} />
+        <RegionCountryFilter
+          label="Region"
+          regionValues={filters.region}
+          countryValues={filters.country}
+          regionCountryMap={regionCountryMap}
+          regionAvailable={available.region}
+          countryAvailable={available.country}
+          onRegionChange={setDim("region")}
+          onCountryChange={setDim("country")}
+        />
         <MultiSelect label="Brand" values={filters.brand} options={optsFor("brand", brandOptions)} onChange={setDim("brand")} />
         <MultiSelect label="Platform" values={filters.platform} options={optsFor("platform", platformOptions)} onChange={setDim("platform")} />
         <MultiSelect label="Recall ID" values={filters.recall} options={optsFor("recall", recallOptions)} onChange={setDim("recall")} />
@@ -989,15 +1266,13 @@ function KpiCard({ kpi, onOpen, primary }) {
           <div className="flex items-center gap-1 text-xs font-bold" style={{ color: C.amber }}>
             <Sparkles size={12} /> AI Insight
           </div>
-          {kpi.insight ? (
+          {kpi.insight && (
             <>
               <p className="text-xs mt-0.5 text-center font-medium" style={{
                 color: C.text, display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden",
               }}>{kpi.insight}</p>
               <p className="text-xs mt-0.5 text-center truncate" style={{ color: C.dim }}>{kpi.insightMeta}</p>
             </>
-          ) : (
-            <p className="text-xs mt-0.5" style={{ color: C.dim }}>available soon</p>
           )}
         </div>
       )}
@@ -1027,9 +1302,17 @@ function DlcmLink({ icon: Icon, l1, l2, disabled, onClick }) {
   );
 }
 
-function Overview({ onOpen, onDlcm, filters, filteredRows }) {
+function Overview({ onOpen, onDlcm, filters, filteredRows, aiSummaries }) {
   const scope = filterScope(filters);
-  const primaries = KPIS.filter((k) => k.tier === "primary").map((k) => runtimeKpi(k, filteredRows, scope));
+  // Each primary card's insight is the top-ranked AI summary compatible with
+  // this KPI and the active region/brand/platform filters. No match (e.g. a
+  // filter combination the AI summaries don't cover) means no insight —
+  // the card shows nothing rather than an unrelated or stale one.
+  const withLiveInsight = (k) => {
+    const s = summariesMatchingScope(aiSummaries, k.id, filters)[0];
+    return { ...k, insight: s ? (s.headline || s.fact) : "", insightMeta: s ? formatInsightMeta(s) : "" };
+  };
+  const primaries = KPIS.filter((k) => k.tier === "primary").map((k) => withLiveInsight(runtimeKpi(k, filteredRows, scope)));
   const secondaries = KPIS.filter((k) => k.tier === "secondary").map((k) => runtimeKpi(k, filteredRows, scope));
   return (
     <div className="px-4 py-1.5 flex flex-col gap-1.5" style={{ minHeight: "100%" }}>
@@ -1088,32 +1371,31 @@ function BackButton({ onBack }) {
   );
 }
 
-function Detail({ kpiId, onBack, filters, filteredRows }) {
+function NoData({ label = "No data for the current filter selection" }) {
+  return (
+    <div className="flex items-center justify-center h-full text-sm" style={{ color: C.dim }}>
+      {label}
+    </div>
+  );
+}
+
+function Detail({ kpiId, onBack, filters, filteredRows, aiSummaries }) {
   const scope = filterScope(filters);
   const kpi = runtimeKpi(KPIS.find((k) => k.id === kpiId), filteredRows, scope);
   const [range, setRange] = useState(30);
-  const volScale = kpi.scaleWithFleet ? scope.scale : 1;
-  const series = useMemo(() => {
-    const actualSeries = buildKpiSeries(filteredRows, kpiId, range);
-    return actualSeries.length ? actualSeries : genSeries(
-      kpi.seed + scope.seedShift,
-      kpi.base * volScale,
-      kpi.vol * Math.max(volScale, 0.15),
-      range,
-      kpi.drift * volScale,
-      filters.to
-    );
-  }, [filteredRows, kpiId, kpi.seed, kpi.base, kpi.vol, kpi.drift, volScale, scope.seedShift, range, filters.to]);
-  const byBrand = useMemo(() => {
-    const actual = buildKpiBreakdown(filteredRows, kpiId, "brand");
-    return actual.length ? actual : genBreakdown(kpi.seed + scope.seedShift, BRANDS, kpi.base * volScale);
-  }, [filteredRows, kpiId, kpi.seed, kpi.base, volScale, scope.seedShift]);
-  const byRegion = useMemo(() => {
-    const actual = buildKpiBreakdown(filteredRows, kpiId, "region");
-    return actual.length ? actual : genBreakdown(kpi.seed + scope.seedShift + 5, REGIONS, kpi.base * volScale);
-  }, [filteredRows, kpiId, kpi.seed, kpi.base, volScale, scope.seedShift]);
+  // Charts render backend rows only — an empty result shows an empty state,
+  // never a synthetic series.
+  const series = useMemo(() => buildKpiSeries(filteredRows, kpiId, range), [filteredRows, kpiId, range]);
+  const byBrand = useMemo(() => buildKpiBreakdown(filteredRows, kpiId, "brand"), [filteredRows, kpiId]);
+  const byRegion = useMemo(() => buildKpiBreakdown(filteredRows, kpiId, "region"), [filteredRows, kpiId]);
+  // Only summaries compatible with this KPI and the active region/brand/
+  // platform filters — a mismatched selection yields [], not a fallback.
+  const summaries = useMemo(
+    () => summariesMatchingScope(aiSummaries, kpiId, filters),
+    [aiSummaries, kpiId, filters]
+  );
   const Icon = kpi.icon;
-  const trendUp = series[series.length - 1].value >= series[0].value;
+  const trendUp = series.length > 1 ? series[series.length - 1].value >= series[0].value : true;
   const trendGood = kpi.goodWhen === "up" ? trendUp : !trendUp;
   const dimIf = (name, sel) => (sel.length === 0 || sel.includes(name) ? 1 : 0.3);
 
@@ -1168,6 +1450,7 @@ function Detail({ kpiId, onBack, filters, filteredRows }) {
         }
       >
         <div style={{ height: "clamp(140px, 21vh, 320px)" }}>
+        {series.length === 0 ? <NoData /> : (
         <ResponsiveContainer width="100%" height="100%">
           <AreaChart data={series} margin={{ top: 5, right: 10, left: -10, bottom: 0 }}>
             <defs>
@@ -1188,6 +1471,7 @@ function Detail({ kpiId, onBack, filters, filteredRows }) {
             <Area type="monotone" dataKey="value" stroke={C.accent} strokeWidth={2} fill="url(#g1)" isAnimationActive={false} />
           </AreaChart>
         </ResponsiveContainer>
+        )}
         </div>
       </Panel>
 
@@ -1195,6 +1479,7 @@ function Detail({ kpiId, onBack, filters, filteredRows }) {
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <Panel title="Breakdown by Brand">
           <div style={{ height: "clamp(120px, 16vh, 280px)" }}>
+          {byBrand.length === 0 ? <NoData /> : (
           <ResponsiveContainer width="100%" height="100%">
             <BarChart data={byBrand} margin={{ top: 5, right: 10, left: -10, bottom: 0 }}>
               <CartesianGrid stroke={C.cardBorderSoft} strokeDasharray="3 3" vertical={false} />
@@ -1208,10 +1493,12 @@ function Detail({ kpiId, onBack, filters, filteredRows }) {
               </Bar>
             </BarChart>
           </ResponsiveContainer>
+          )}
           </div>
         </Panel>
         <Panel title="Breakdown by Region">
           <div style={{ height: "clamp(120px, 16vh, 280px)" }}>
+          {byRegion.length === 0 ? <NoData /> : (
           <ResponsiveContainer width="100%" height="100%">
             <PieChart>
               <Pie data={byRegion} dataKey="value" nameKey="name" innerRadius="48%" outerRadius="78%"
@@ -1224,40 +1511,35 @@ function Detail({ kpiId, onBack, filters, filteredRows }) {
               <Legend wrapperStyle={{ fontSize: 12, color: C.dim }} />
             </PieChart>
           </ResponsiveContainer>
+          )}
           </div>
         </Panel>
       </div>
 
-      {/* AI insights & anomalies */}
-      <Panel title={
-        <span className="flex items-center gap-2" style={{ color: C.amber }}>
-          <Sparkles size={15} /> AI Insights & Anomalies
-        </span>
-      }>
-        <div className="flex flex-col gap-2">
-          {kpi.insight && (
-            <div className="flex items-start gap-2 p-2 rounded-lg"
-              style={{ background: "rgba(255,181,71,0.08)", border: "1px solid rgba(255,181,71,0.25)" }}>
-              <Sparkles size={15} color={C.amber} className="mt-0.5 shrink-0" />
-              <p className="text-sm" style={{ color: C.text }}>
-                {kpi.insight} <span style={{ color: C.dim }}>{kpi.insightMeta}</span>
-              </p>
-            </div>
-          )}
-          {kpi.anomalies.map((a, i) => (
-            <div key={i} className="flex items-start gap-2 p-2 rounded-lg"
-              style={{
-                background: a.sev === "warn" ? "rgba(255,90,106,0.07)" : "rgba(77,163,255,0.06)",
-                border: `1px solid ${a.sev === "warn" ? "rgba(255,90,106,0.3)" : "rgba(77,163,255,0.2)"}`,
-              }}>
-              {a.sev === "warn"
-                ? <AlertTriangle size={15} color={C.bad} className="mt-0.5 shrink-0" />
-                : <CircleDot size={15} color={C.accent} className="mt-0.5 shrink-0" />}
-              <p className="text-sm" style={{ color: C.text }}>{a.text}</p>
-            </div>
-          ))}
-        </div>
-      </Panel>
+      {/* AI insights & anomalies — hidden entirely when the active filters
+          don't match any AI summary, rather than showing an empty panel
+          or an unrelated one. */}
+      {summaries.length > 0 && (
+        <Panel title={
+          <span className="flex items-center gap-2" style={{ color: C.amber }}>
+            <Sparkles size={15} /> AI Insights & Anomalies
+          </span>
+        }>
+          <div className="flex flex-col gap-2">
+            {summaries.slice(0, 5).map((s, i) => (
+              <div key={i} className="flex items-start gap-2 p-2 rounded-lg"
+                style={{ background: "rgba(255,181,71,0.08)", border: "1px solid rgba(255,181,71,0.25)" }}>
+                <Sparkles size={15} color={C.amber} className="mt-0.5 shrink-0" />
+                <div className="min-w-0">
+                  <p className="text-sm font-semibold" style={{ color: C.text }}>{s.headline}</p>
+                  <p className="text-sm" style={{ color: C.text }}>{s.fact}</p>
+                  <p className="text-xs mt-0.5" style={{ color: C.dim }}>{formatInsightMeta(s)}</p>
+                </div>
+              </div>
+            ))}
+          </div>
+        </Panel>
+      )}
     </div>
   );
 }
@@ -1265,7 +1547,8 @@ function Detail({ kpiId, onBack, filters, filteredRows }) {
 /* ------------------------------------------------------------------ */
 /* DLCM Release Statistics                                             */
 /* ------------------------------------------------------------------ */
-function DlcmStatistics({ onBack }) {
+function DlcmStatistics({ onBack, releaseRows }) {
+  const releases = useMemo(() => releasesFromRows(releaseRows), [releaseRows]);
   return (
     <div className="px-4 py-3 flex flex-col gap-3">
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -1287,7 +1570,7 @@ function DlcmStatistics({ onBack }) {
         <Panel title="Vehicles Updated per Release (millions)">
           <div style={{ height: "clamp(140px, 24vh, 280px)" }}>
           <ResponsiveContainer width="100%" height="100%">
-            <BarChart data={RELEASES} margin={{ top: 5, right: 10, left: -10, bottom: 0 }}>
+            <BarChart data={releases} margin={{ top: 5, right: 10, left: -10, bottom: 0 }}>
               <CartesianGrid stroke={C.cardBorderSoft} strokeDasharray="3 3" vertical={false} />
               <XAxis dataKey="id" tick={{ fill: C.dim, fontSize: 11 }} tickLine={false} axisLine={false} />
               <YAxis tick={{ fill: C.faint, fontSize: 11 }} tickLine={false} axisLine={false} width={40} />
@@ -1301,7 +1584,7 @@ function DlcmStatistics({ onBack }) {
         <Panel title="Error Rate per Release (per 1k successful updates)">
           <div style={{ height: "clamp(140px, 24vh, 280px)" }}>
           <ResponsiveContainer width="100%" height="100%">
-            <BarChart data={RELEASES} margin={{ top: 5, right: 10, left: -10, bottom: 0 }}>
+            <BarChart data={releases} margin={{ top: 5, right: 10, left: -10, bottom: 0 }}>
               <CartesianGrid stroke={C.cardBorderSoft} strokeDasharray="3 3" vertical={false} />
               <XAxis dataKey="id" tick={{ fill: C.dim, fontSize: 11 }} tickLine={false} axisLine={false} />
               <YAxis tick={{ fill: C.faint, fontSize: 11 }} tickLine={false} axisLine={false} width={40} />
@@ -1328,7 +1611,7 @@ function DlcmStatistics({ onBack }) {
               </tr>
             </thead>
             <tbody>
-              {RELEASES.map((r) => (
+              {releases.map((r) => (
                 <tr key={r.id} style={{ borderBottom: `1px solid ${C.cardBorderSoft}` }}>
                   <td className="px-3 py-2 font-bold">{r.id}</td>
                   <td className="px-3 py-2" style={{ color: C.dim }}>{r.date}</td>
@@ -1381,17 +1664,24 @@ function CompareStat({ label, unit, a, b, relA, relB, goodWhen }) {
   );
 }
 
-function DlcmComparison({ onBack }) {
-  const [relA, setRelA] = useState("15.6.0");
-  const [relB, setRelB] = useState("15.5.0");
-  const A = RELEASES.find((r) => r.id === relA);
-  const B = RELEASES.find((r) => r.id === relB);
+function DlcmComparison({ onBack, releaseRows, adoptionRows }) {
+  const releases = useMemo(() => releasesFromRows(releaseRows), [releaseRows]);
+  const [relA, setRelA] = useState(null);
+  const [relB, setRelB] = useState(null);
+  // Selections must survive the switch from scaffold to live release ids.
+  const ids = releases.map((r) => r.id);
+  const idA = relA && ids.includes(relA) ? relA : ids[0];
+  const idB = relB && ids.includes(relB) && relB !== idA ? relB : ids.find((id) => id !== idA) ?? ids[0];
+  const A = releases.find((r) => r.id === idA);
+  const B = releases.find((r) => r.id === idB);
 
+  const curveA = useMemo(() => (A ? adoptionSeriesFor(A, adoptionRows) : []), [A, adoptionRows]);
+  const curveB = useMemo(() => (B ? adoptionSeriesFor(B, adoptionRows) : []), [B, adoptionRows]);
   const data = useMemo(() => {
-    const ca = adoptionCurve(A);
-    const cb = adoptionCurve(B);
-    return ca.map((v, i) => ({ day: i, [A.id]: v, [B.id]: cb[i] }));
-  }, [A, B]);
+    const len = Math.max(curveA.length, curveB.length);
+    return Array.from({ length: len }, (_, i) => ({ day: i, [A.id]: curveA[i], [B.id]: curveB[i] }));
+  }, [curveA, curveB, A, B]);
+  const endValue = (curve) => (curve.length ? curve[Math.min(30, curve.length - 1)] : 0);
 
   const endLabel = (name, color) => (props) => {
     const { x, y, index } = props;
@@ -1416,16 +1706,16 @@ function DlcmComparison({ onBack }) {
           </div>
         </div>
         <div className="flex items-end gap-2">
-          <Select label="Release A" value={relA} options={RELEASES.map((r) => r.id).filter((id) => id !== relB)}
+          <Select label="Release A" value={idA} options={ids.filter((id) => id !== idB)}
             onChange={(v) => v !== "All" && setRelA(v)} />
-          <Select label="Release B" value={relB} options={RELEASES.map((r) => r.id).filter((id) => id !== relA)}
+          <Select label="Release B" value={idB} options={ids.filter((id) => id !== idA)}
             onChange={(v) => v !== "All" && setRelB(v)} />
         </div>
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
         <CompareStat label="Adoption after 30 days" unit="%" goodWhen="up"
-          a={+adoptionCurve(A)[30].toFixed(1)} b={+adoptionCurve(B)[30].toFixed(1)} relA={A.id} relB={B.id} />
+          a={+endValue(curveA).toFixed(1)} b={+endValue(curveB).toFixed(1)} relA={A.id} relB={B.id} />
         <CompareStat label="Errors per 1k updates" unit="" goodWhen="down"
           a={A.errPer1k} b={B.errPer1k} relA={A.id} relB={B.id} />
         <CompareStat label="Avg installation duration" unit=" min" goodWhen="down"
@@ -1483,6 +1773,10 @@ export default function App() {
   const [backendRows, setBackendRows] = useState([]);
   const [campaignRows, setCampaignRows] = useState([]);
   const [countryRows, setCountryRows] = useState([]);
+  const [releaseRows, setReleaseRows] = useState([]);
+  const [adoptionRows, setAdoptionRows] = useState([]);
+  const [aiSummaries, setAiSummaries] = useState([]);
+  const [dataMode, setDataMode] = useState(null); // "live" | "local" | null (unknown yet)
   const [backendError, setBackendError] = useState(null);
   const [backendLoading, setBackendLoading] = useState(true);
   const [dimensionError, setDimensionError] = useState(null);
@@ -1503,10 +1797,19 @@ export default function App() {
     [campaignRows]
   );
 
-  const regionOptions = useMemo(
-    () => uniqueDimValues(countryRows, normalizeRegionValue),
-    [countryRows]
-  );
+  // Region -> its countries, for the nested Region/Country filter control.
+  const regionCountryMap = useMemo(() => {
+    const map = new Map();
+    for (const row of countryRows) {
+      const region = normalizeRegionValue(row);
+      const country = normalizeCountryValue(row);
+      if (!region || !country) continue;
+      if (!map.has(region)) map.set(region, []);
+      map.get(region).push(country);
+    }
+    for (const list of map.values()) list.sort();
+    return map;
+  }, [countryRows]);
 
   const countryLookup = useMemo(
     () => buildCountryLookup(countryRows),
@@ -1518,13 +1821,29 @@ export default function App() {
     [campaignRows]
   );
 
-  const filteredRows = useMemo(
-    () => backendRows.filter((row) => matchesRowFilters(row, filters, countryLookup, campaignLookup)),
-    [backendRows, filters, countryLookup, campaignLookup]
+  // Every fact dataset is enriched the same way — joined to dim_campaign via
+  // `campaign` and to dim_country via `country_iso` — so region/country/
+  // brand/platform/recall filtering (and the date range) works uniformly
+  // across fact_main, fact_release, and fact_adoption_rate.
+  const enrichedRows = useMemo(
+    () => backendRows.map((row) => enrichRow(row, campaignLookup, countryLookup)),
+    [backendRows, campaignLookup, countryLookup]
   );
 
-  const scope = filterScope(filters);
-  const scopeSummary = scope.active.length ? scope.active.join(" / ") : "All data";
+  const filteredRows = useMemo(
+    () => enrichedRows.filter((row) => matchesRowFilters(row, filters)),
+    [enrichedRows, filters]
+  );
+
+  const filteredReleaseRows = useMemo(
+    () => releaseRows.map((row) => enrichRow(row, campaignLookup, countryLookup)).filter((row) => matchesRowFilters(row, filters)),
+    [releaseRows, campaignLookup, countryLookup, filters]
+  );
+
+  const filteredAdoptionRows = useMemo(
+    () => adoptionRows.map((row) => enrichRow(row, campaignLookup, countryLookup)).filter((row) => matchesRowFilters(row, filters)),
+    [adoptionRows, campaignLookup, countryLookup, filters]
+  );
 
   useEffect(() => {
     localStorage.setItem("ota-nav-open", String(navOpen));
@@ -1581,8 +1900,36 @@ export default function App() {
       }
     };
 
+    const fetchAuxiliaryData = async () => {
+      try {
+        const [releaseRes, adoptionRes, aiRes] = await Promise.all([
+          fetch("/api/fact_release_combined?limit=1000"),
+          fetch("/api/fact_adoption_rate_combined?limit=2000"),
+          fetch("/api/fact_ai_summaries_latest?limit=100"),
+        ]);
+        if (releaseRes.ok) setReleaseRows(await releaseRes.json());
+        if (adoptionRes.ok) setAdoptionRows(await adoptionRes.json());
+        if (aiRes.ok) setAiSummaries(await aiRes.json());
+      } catch (error) {
+        console.info("Auxiliary data fetch failed; DLCM and insights use fallbacks", error);
+      }
+    };
+
+    // Reflects the backend's mode at startup (see server.js /api/status) —
+    // not a live health check, since switching modes needs a restart anyway.
+    const fetchStatus = async () => {
+      try {
+        const res = await fetch("/api/status");
+        if (res.ok) setDataMode((await res.json()).mode);
+      } catch (error) {
+        console.info("Status fetch failed; connection indicator stays hidden", error);
+      }
+    };
+
     fetchBackendData();
     fetchDimensionData();
+    fetchAuxiliaryData();
+    fetchStatus();
   }, []);
 
   // Subscribe to WebSocket for live updates, fallback to SSE if needed
@@ -1613,7 +1960,7 @@ export default function App() {
     const connectWebSocket = () => {
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const host = window.location.hostname;
-      const wsUrl = import.meta.env.DEV ? `${protocol}//${host}:4000` : `${protocol}//${window.location.host}`;
+      const wsUrl = import.meta.env.DEV ? `${protocol}//${host}:5001` : `${protocol}//${window.location.host}`;
       try {
         ws = new WebSocket(wsUrl);
         ws.onmessage = (event) => {
@@ -1678,45 +2025,45 @@ export default function App() {
       <TopBar
         theme={theme} onToggleTheme={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
         navOpen={navOpen} onToggleNav={() => setNavOpen((o) => !o)}
-        backendStatus={
-          backendLoading || dimensionLoading
-            ? "Loading backend…"
-            : backendError || dimensionError
-              ? `Backend error: ${backendError || dimensionError}`
-              : `${filteredRows.length} rows matched from ${backendRows.length} backend rows · ${scopeSummary}`
-        }
       />
       <FilterBar
         filters={filters}
         setFilters={setFilters}
-        regionOptions={regionOptions}
+        regionCountryMap={regionCountryMap}
         brandOptions={brandOptions}
         platformOptions={platformOptions}
         recallOptions={recallOptions}
-        campaignRows={campaignRows}
-        countryRows={countryRows}
+        enrichedRows={enrichedRows}
       />
       <div className="flex-1 min-h-0 flex flex-row">
         <SideNav open={navOpen} onClose={() => setNavOpen(false)} route={route} onNavigate={setRoute}
-          backendStatus={backendLoading ? "Loading backend…" : backendError ? `Backend error: ${backendError}` : `${backendRows.length} backend rows loaded`} />
-        {/* Pages fill the remaining viewport height. The Overview/landing page
-            never shows a scrollbar — it clips instead of scrolling on windows
-            too short to fit it. Detail/DLCM pages keep a scroll fallback since
-            they stack more content (charts + insights) than a short window
-            can show in full. */}
-        <main className={`flex-1 min-h-0 min-w-0 ${route.page === "overview" ? "overflow-hidden" : "overflow-auto"}`}>
+          backendLoading={backendLoading} backendError={backendError} dataMode={dataMode} />
+        {/* Pages fill the remaining viewport height and scroll if their
+            content doesn't fit. The Overview page used to clip instead of
+            scrolling here, which silently hid the DLCM buttons whenever the
+            FilterBar grew taller (e.g. the "Active scope" row appearing) —
+            a scrollbar only appears when content actually overflows, so
+            there's no visual cost on a normal-height viewport. */}
+        <main className="flex-1 min-h-0 min-w-0 overflow-auto">
           {route.page === "overview" && (
             <Overview
               filters={filters}
+              filteredRows={filteredRows}
+              aiSummaries={aiSummaries}
               onOpen={(kpiId) => setRoute({ page: "detail", kpiId })}
               onDlcm={(name) => setRoute({ page: "dlcm", name })}
             />
           )}
           {route.page === "detail" && (
-            <Detail kpiId={route.kpiId} filters={filters} onBack={goHome} />
+            <Detail kpiId={route.kpiId} filters={filters} filteredRows={filteredRows}
+              aiSummaries={aiSummaries} onBack={goHome} />
           )}
-          {route.page === "dlcm" && route.name === "Statistics" && <DlcmStatistics onBack={goHome} />}
-          {route.page === "dlcm" && route.name === "Comparison" && <DlcmComparison onBack={goHome} />}
+          {route.page === "dlcm" && route.name === "Statistics" && (
+            <DlcmStatistics onBack={goHome} releaseRows={filteredReleaseRows} />
+          )}
+          {route.page === "dlcm" && route.name === "Comparison" && (
+            <DlcmComparison onBack={goHome} releaseRows={filteredReleaseRows} adoptionRows={filteredAdoptionRows} />
+          )}
         </main>
       </div>
     </div>

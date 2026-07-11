@@ -57,9 +57,14 @@ function getTableCandidates() {
   const PROD_SCHEMA = process.env.DATALAKE_PROD_SCHEMA || 'hive_metastore.datalake_prod';
   const INT_SCHEMA = process.env.DATALAKE_INT_SCHEMA || 'hive_metastore.datalake_int';
   const DEV_SCHEMA = process.env.DATALAKE_DEV_SCHEMA || 'hive_metastore.datalake_dev';
+  // The USCA workspace exposes *_prod tables in datalake_prod and *_int
+  // tables in datalake_int, so the usca connection must probe both schemas.
+  // Keep this list identical to getTableCandidates() in server.js.
   return [
     { schema: PROD_SCHEMA, connection: 'prod' },
+    { schema: PROD_SCHEMA, connection: 'usca' },
     { schema: INT_SCHEMA, connection: 'usca' },
+    { schema: INT_SCHEMA, connection: 'int' },
     { schema: DEV_SCHEMA, connection: 'int' },
   ];
 }
@@ -226,12 +231,15 @@ async function queryFactMainCombined(limit = 100, skipEnrich = false) {
 
 async function queryFactMainEUwithUSCACombined(limit = 100) {
   const tables = [
-    { name: 'fact_main_oru23_prod', metadata: { Source: 'EU' } },
-    { name: 'fact_main_oru234chn_oru23nar', metadata: { Source: 'EU' } },
-    { name: 'fact_main_oru4_nar', metadata: { Source: 'EU' } },
-    { name: 'fact_main_orunext', metadata: { Source: 'EU' } },
-    { name: 'fact_main_oru4_prod', metadata: { Update_Technology: 'ORU4', Platform: 'USCA' }, connectionHint: 'usca' },
-    { name: 'fact_main_oru4_int', metadata: { Source: 'USCA', Update_Technology: 'ORU4' }, connectionHint: 'usca' },
+    // EU: ORU4 + ORU23 (+ ORUnext)
+    { name: 'fact_main_oru4_prod', metadata: { Source: 'EU', Update_Technology: 'ORU4', Platform: 'MEB' }, connectionHint: 'prod' },
+    { name: 'fact_main_oru23_prod', metadata: { Source: 'EU', Update_Technology: 'ORU23', Platform: 'MQB/MLB' } },
+    { name: 'fact_main_orunext', metadata: { Source: 'EU', Update_Technology: 'ORUnext' } },
+    // NAR/CN: ORU4 + ORU23
+    { name: 'fact_main_oru4_nar', metadata: { Source: 'NAR/CN', Update_Technology: 'ORU4', Platform: 'MEB' } },
+    { name: 'fact_main_oru234chn_oru23nar', metadata: { Source: 'NAR/CN' } },
+    // US/CA: ORU4
+    { name: 'fact_main_oru4_int', metadata: { Source: 'USCA', Update_Technology: 'ORU4', Platform: 'MEB' }, connectionHint: 'usca' },
   ];
   return queryTablesCombined(tables, limit);
 }
@@ -246,8 +254,9 @@ async function queryFactAdoptionRateCombined(limit = 100) {
 
 async function queryFactAdoptionRateEUwithUSCACombined(limit = 100) {
   const tables = [
-    { name: 'fact_adoption_rate_oru4_prod', metadata: { Update_Technology: 'ORU4', Platform: 'MEB' } },
+    { name: 'fact_adoption_rate_oru4_prod', metadata: { Source: 'EU', Update_Technology: 'ORU4', Platform: 'MEB' } },
     { name: 'fact_adoption_rate_oru23', metadata: { Source: 'EU' } },
+    { name: 'fact_adoption_rate_oru4_nar', metadata: { Source: 'NAR/CN', Update_Technology: 'ORU4' } },
     { name: 'fact_adoption_rate_oru4_int', metadata: { Source: 'USCA', Update_Technology: 'ORU4' }, connectionHint: 'usca' },
   ];
   return queryTablesCombined(tables, limit);
@@ -255,7 +264,7 @@ async function queryFactAdoptionRateEUwithUSCACombined(limit = 100) {
 
 async function queryFactFrequencyEUwithUSCACombined(limit = 100) {
   const tables = [
-    { name: 'fact_frequency_oru4_prod', metadata: { Update_Technology: 'ORU4', Platform: 'MEB' } },
+    { name: 'fact_frequency_oru4_prod', metadata: { Source: 'EU', Update_Technology: 'ORU4', Platform: 'MEB' } },
     { name: 'fact_frequency_oru23_prod', metadata: { Source: 'EU' } },
     { name: 'fact_frequency_oru4_int', metadata: { Source: 'USCA', Update_Technology: 'ORU4' }, connectionHint: 'usca' },
   ];
@@ -282,15 +291,15 @@ async function queryFactReleaseEUwithUSCACombined(limit = 100) {
 
 async function queryFactEcuCombined(limit = 100) {
   const tables = [
-    { name: 'fact_ecu_oru4_prod', metadata: { Update_Technology: 'ORU4', Platform: 'MEB' } },
-    { name: 'fact_ecu_oru23' },
+    { name: 'fact_ecu_oru4_prod', metadata: { Source: 'EU', Update_Technology: 'ORU4', Platform: 'MEB' } },
+    { name: 'fact_ecu_oru23', metadata: { Source: 'EU' } },
   ];
   return queryTablesCombined(tables, limit);
 }
 
 async function queryFactEcuEUCombined(limit = 100) {
   const tables = [
-    { name: 'fact_ecu_oru4_prod', metadata: { Update_Technology: 'ORU4', Platform: 'MEB' } },
+    { name: 'fact_ecu_oru4_prod', metadata: { Source: 'EU', Update_Technology: 'ORU4', Platform: 'MEB' } },
     { name: 'fact_ecu_oru23_prod', metadata: { Source: 'EU' } },
   ];
   return queryTablesCombined(tables, limit);
@@ -306,7 +315,7 @@ async function queryDimCampaignEUwithUSCANARCombined(limit = 100) {
     { name: 'dim_campaign_oru23_prod', metadata: { Source: 'EU', Update_Technology: 'ORU23' } },
     { name: 'dim_campaign_orunext', metadata: { Source: 'EU' } },
     { name: 'dim_campaign_oru4_int', metadata: { Source: 'USCA', Update_Technology: 'ORU4' }, connectionHint: 'usca' },
-    { name: 'dim_campaign_oru234chn_oru23nar', metadata: { Source: 'NAR/CH' } },
+    { name: 'dim_campaign_oru234chn_oru23nar', metadata: { Source: 'NAR/CN' } },
   ];
   return queryTablesCombined(tables, limit);
 }
@@ -316,7 +325,7 @@ async function queryDimCountryEUwithUSCANARCombined(limit = 100) {
     { name: 'dim_country_oru4_prod', skipMetadata: true },
     { name: 'dim_country_oru23_prod', metadata: { Source: 'EU' }, skipMetadata: true },
     { name: 'dim_country_oru4_int', metadata: { Source: 'USCA' }, connectionHint: 'usca', skipMetadata: true },
-    { name: 'dim_country_oru234chn_oru23nar', metadata: { Source: 'NAR/CH' }, skipMetadata: true },
+    { name: 'dim_country_oru234chn_oru23nar', metadata: { Source: 'NAR/CN' }, skipMetadata: true },
   ];
   const rows = await queryTablesCombined(tables, 0);
   const filtered = rows.filter((row) => {
@@ -427,10 +436,12 @@ function enrichFactRows(rows, campaignRows, countryRows) {
   for (const row of campaignRows) {
     const campaign = row.campaign ?? row.Campaign ?? row.campaign_id ?? row.id ?? row.name ?? '';
     if (!campaign) continue;
+    // recall_id is the campaign column itself unless an explicit
+    // recall/recall_id column exists — each campaign IS a recall.
     campaignLookup.set(campaign, {
       brand: row.brand || row.Brand,
       platform: row.platform || row.Platform,
-      recall: row.recall || row.Recall || row.recall_id || row.Recall_ID,
+      recall: row.recall || row.Recall || row.recall_id || row.Recall_ID || campaign,
     });
   }
   const countryLookup = new Map();
@@ -466,19 +477,18 @@ function enrichFactRows(rows, campaignRows, countryRows) {
 
 async function exportAllCsv() {
   ensureDataDir();
+  // One canonical file per dataset — each query already merges the full
+  // EU + US/CA + NAR/CN combination (fact_ecu is EU-only by design).
+  // Keep these names in sync with LOCAL_ENDPOINT_ALIASES in server.js and
+  // scripts/generate-mock-data.mjs.
   const exports = [
-    { name: 'fact_main_combined.csv', fn: () => queryFactMainCombined(MAX_ROWS) },
-    { name: 'fact_main_eu_usca_combined.csv', fn: () => queryFactMainEUwithUSCACombined(MAX_ROWS) },
-    { name: 'fact_targeted_vehicles_combined.csv', fn: () => queryFactTargetedVehiclesCombined(MAX_ROWS) },
-    { name: 'fact_adoption_rate_combined.csv', fn: () => queryFactAdoptionRateCombined(MAX_ROWS) },
-    { name: 'fact_adoption_rate_eu_usca_combined.csv', fn: () => queryFactAdoptionRateEUwithUSCACombined(MAX_ROWS) },
-    { name: 'fact_ecu_combined.csv', fn: () => queryFactEcuCombined(MAX_ROWS) },
-    { name: 'fact_ecu_eu_combined.csv', fn: () => queryFactEcuEUCombined(MAX_ROWS) },
-    { name: 'fact_release_combined.csv', fn: () => queryFactReleaseCombined(MAX_ROWS) },
-    { name: 'dim_campaign_combined.csv', fn: () => queryDimCampaignCombined(MAX_ROWS) },
-    { name: 'dim_campaign_eu_usca_narch_combined.csv', fn: () => queryDimCampaignEUwithUSCANARCombined(MAX_ROWS) },
-    { name: 'dim_country_combined.csv', fn: () => queryDimCountryCombined(MAX_ROWS) },
-    { name: 'dim_country_eu_usca_narch_combined.csv', fn: () => queryDimCountryEUwithUSCANARCombined(MAX_ROWS) },
+    { name: 'fact_main.csv', fn: () => queryFactMainCombined(MAX_ROWS) },
+    { name: 'fact_adoption_rate.csv', fn: () => queryFactAdoptionRateEUwithUSCACombined(MAX_ROWS) },
+    { name: 'fact_ecu.csv', fn: () => queryFactEcuCombined(MAX_ROWS) },
+    { name: 'fact_targeted_vehicles.csv', fn: () => queryFactTargetedVehiclesEUwithUSCACombined(MAX_ROWS) },
+    { name: 'fact_release.csv', fn: () => queryFactReleaseEUwithUSCACombined(MAX_ROWS) },
+    { name: 'dim_campaign.csv', fn: () => queryDimCampaignEUwithUSCANARCombined(MAX_ROWS) },
+    { name: 'dim_country.csv', fn: () => queryDimCountryEUwithUSCANARCombined(MAX_ROWS) },
     { name: 'fact_ai_summaries_latest.csv', fn: () => queryAiSummariesLatest(MAX_ROWS) },
   ];
 

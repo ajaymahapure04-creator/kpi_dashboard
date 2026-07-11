@@ -34,6 +34,23 @@ npm run backend
 npm run dev
 ```
 
+### Local data mode (no Databricks needed)
+
+When no Databricks token is configured (or `LOCAL_DATA=1` is set), the
+backend serves rows from `data/*.csv` instead of querying Databricks — the
+frontend works unchanged, including SSE live updates. Set `LOCAL_DATA=0` to
+force live mode.
+
+```bash
+npm run mock-data   # generate deterministic dummy CSVs into data/
+npm run dev-all     # backend picks them up automatically
+```
+
+The same `data/` folder also accepts real exports produced by
+`node scripts/export-combined-csv.js` on a machine with credentials, so you
+can develop against real numbers without a live connection. `data/` is
+gitignored — never commit real exports.
+
 The frontend will normally serve on a Vite port such as:
 
 - `http://localhost:5177/`
@@ -60,7 +77,7 @@ The backend is implemented in `server.js`:
 
 Key environment variables used by `server.js`:
 
-- `PORT` — backend port (default `4000` if not set)
+- `PORT` — backend port (default `5001` if not set, matching the Vite proxy)
 - `DATABRICKS_HOST_EU`, `DATABRICKS_PATH_EU`, `DATABRICKS_TOKEN_EU`
 - `DATABRICKS_INT_HOST`, `DATABRICKS_INT_PATH`, `DATABRICKS_INT_TOKEN`
 - `DATALAKE_PROD_SCHEMA` — default production schema
@@ -89,7 +106,7 @@ Additional per-table metadata is injected where appropriate, for example:
 
 - `Update_Technology`: `ORU4`, `ORU23`
 - `Platform`: `MEB`, `MQB/MLB`, `NA`
-- `Source`: `EU`, `USCA`, `NAR/CH`
+- `Source`: `EU`, `USCA`, `NAR/CN`
 
 ### Row normalization
 
@@ -147,6 +164,8 @@ The backend exposes raw and combined endpoints for live KPI consumption.
 
 - `GET /api/fact_ai_summaries_latest`
 - `GET /api/table_counts`
+- `GET /api/status` — `{ mode: "live" | "local" }`, decided once at server
+  startup; drives the sidebar's Live/Connected-Local-data indicator
 
 ## Live updates
 
