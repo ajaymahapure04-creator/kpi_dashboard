@@ -193,14 +193,30 @@ function enrichRow(row, campaignLookup, countryLookup) {
   };
 }
 
+// Some Databricks exports emit a malformed timestamp with a colon instead of
+// a dot before milliseconds (e.g. "2026-04-12T22:16:49:806Z" instead of the
+// valid "...49.806Z"), which `Date` cannot parse — it silently returns
+// Invalid Date, dropping the row from every date-based calculation. Normalize
+// that one known malformation before parsing.
+function normalizeDateString(raw) {
+  if (typeof raw !== "string") return raw;
+  return raw.replace(/(T\d{2}:\d{2}:\d{2}):(\d{3})(Z|[+-]\d{2}:?\d{2})?$/, "$1.$2$3");
+}
+
+function parseBackendDate(raw) {
+  if (!raw) return null;
+  const d = new Date(normalizeDateString(raw));
+  return Number.isNaN(d.valueOf()) ? null : d;
+}
+
 // filters.from/filters.to bound whichever date-like column a row carries
 // (fact_main/fact_adoption_rate use `date`, fact_release uses `rollout_start`).
 // Rows without any date column are never excluded by the date filter.
 function dateInRange(row, filters) {
   const raw = row.date ?? row.Date ?? row.rollout_start;
   if (!raw) return true;
-  const d = new Date(raw);
-  if (Number.isNaN(d.valueOf())) return true;
+  const d = parseBackendDate(raw);
+  if (!d) return true;
   if (filters.from && d < new Date(filters.from + "T00:00:00")) return false;
   if (filters.to && d > new Date(filters.to + "T23:59:59")) return false;
   return true;
@@ -327,7 +343,11 @@ function releasesFromRows(rows) {
     out.push({
       id,
       campaign: r.campaign,
-      date: String(r.rollout_start ?? r.date ?? ""),
+      date: (() => {
+        const raw = r.rollout_start ?? r.date ?? "";
+        const parsed = parseBackendDate(raw);
+        return parsed ? parsed.toISOString().slice(0, 10) : String(raw);
+      })(),
       vehiclesM: (Number(r.vehicles ?? 0) || 0) / 1e6,
       success: Number(r.success_rate ?? r.success ?? 0) || 0,
       errPer1k: Number(r.err_per_1k ?? r.errPer1k ?? 0) || 0,
@@ -641,8 +661,8 @@ function deltaForKpi(rows, kpiId, days) {
   const dated = [];
   for (const row of rows) {
     const raw = row.date ?? row.Date;
-    const parsed = raw ? new Date(raw) : null;
-    if (parsed && !Number.isNaN(parsed.valueOf())) dated.push({ row, time: parsed.valueOf() });
+    const parsed = parseBackendDate(raw);
+    if (parsed) dated.push({ row, time: parsed.valueOf() });
   }
   if (!dated.length) return null;
   const end = Math.max(...dated.map((d) => d.time));
@@ -679,8 +699,8 @@ function buildKpiSeries(rows, kpiId, range) {
   const dateMap = new Map();
   for (const row of rows) {
     const rawDate = row.date ?? row.Date;
-    const parsed = rawDate ? new Date(rawDate) : null;
-    if (!parsed || Number.isNaN(parsed.valueOf())) continue;
+    const parsed = parseBackendDate(rawDate);
+    if (!parsed) continue;
     const key = parsed.toISOString().slice(0, 10);
     const bucket = dateMap.get(key) || [];
     bucket.push(row);
