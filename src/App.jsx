@@ -193,14 +193,16 @@ function enrichRow(row, campaignLookup, countryLookup) {
   };
 }
 
-// Some Databricks exports emit a malformed timestamp with a colon instead of
-// a dot before milliseconds (e.g. "2026-04-12T22:16:49:806Z" instead of the
-// valid "...49.806Z"), which `Date` cannot parse — it silently returns
-// Invalid Date, dropping the row from every date-based calculation. Normalize
-// that one known malformation before parsing.
+// Some Databricks exports emit a malformed timestamp with a comma or a colon
+// instead of a dot before milliseconds (e.g. "2026-04-12T22:16:49:806Z" or
+// "...49,806Z" instead of the valid "...49.806Z"), which `Date` cannot parse
+// — it silently returns Invalid Date, dropping the row from every date-based
+// calculation. The backend now repairs this at the source (transformRow),
+// but this stays as a defensive fallback for already-exported CSVs. Normalize
+// before parsing.
 function normalizeDateString(raw) {
   if (typeof raw !== "string") return raw;
-  return raw.replace(/(T\d{2}:\d{2}:\d{2}):(\d{3})(Z|[+-]\d{2}:?\d{2})?$/, "$1.$2$3");
+  return raw.replace(/(T\d{2}:\d{2}:\d{2})[,:](\d{3})(Z|[+-]\d{2}:?\d{2})?$/, "$1.$2$3");
 }
 
 function parseBackendDate(raw) {
@@ -1891,7 +1893,7 @@ export default function App() {
   useEffect(() => {
     const fetchBackendData = async () => {
       try {
-        const response = await fetch("/api/fact_main_oru4_prod?limit=1000");
+        const response = await fetch("/api/fact_main_oru4_prod");
         if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
         const data = await response.json();
         setBackendRows(data);
@@ -1905,8 +1907,8 @@ export default function App() {
     const fetchDimensionData = async () => {
       try {
         const [campaignRes, countryRes] = await Promise.all([
-          fetch("/api/dim_campaign_combined?limit=1000"),
-          fetch("/api/dim_country_combined?limit=1000"),
+          fetch("/api/dim_campaign_combined"),
+          fetch("/api/dim_country_combined"),
         ]);
         if (!campaignRes.ok) throw new Error(`Campaign fetch failed: ${campaignRes.status} ${campaignRes.statusText}`);
         if (!countryRes.ok) throw new Error(`Country fetch failed: ${countryRes.status} ${countryRes.statusText}`);
@@ -1923,9 +1925,9 @@ export default function App() {
     const fetchAuxiliaryData = async () => {
       try {
         const [releaseRes, adoptionRes, aiRes] = await Promise.all([
-          fetch("/api/fact_release_combined?limit=1000"),
-          fetch("/api/fact_adoption_rate_combined?limit=2000"),
-          fetch("/api/fact_ai_summaries_latest?limit=100"),
+          fetch("/api/fact_release_combined"),
+          fetch("/api/fact_adoption_rate_combined"),
+          fetch("/api/fact_ai_summaries_latest"),
         ]);
         if (releaseRes.ok) setReleaseRows(await releaseRes.json());
         if (adoptionRes.ok) setAdoptionRows(await adoptionRes.json());

@@ -141,8 +141,21 @@ async function executeAgainstFirstAvailable(tableConfigOrName, queryBuilder) {
   throw lastError || new Error(`Table not found in any configured schema: ${tableName}`);
 }
 
+// Some Databricks timestamp columns come back with a comma or a colon
+// instead of a dot before the milliseconds (e.g. "13:38:00,000Z" or
+// "13:38:00:000Z" instead of "13:38:00.000Z"). Both are invalid per RFC
+// 3339/ISO 8601 — `Date` can't parse them, and a raw comma also forces CSV
+// quoting downstream. Repair it wherever it appears.
+function normalizeTimestampString(value) {
+  if (typeof value !== 'string') return value;
+  return value.replace(/(T\d{2}:\d{2}:\d{2})[,:](\d{3})(Z|[+-]\d{2}:?\d{2})?$/, '$1.$2$3');
+}
+
 function transformRow(row) {
   const result = Array.isArray(row) ? Object.assign({}, row) : { ...row };
+  for (const key of Object.keys(result)) {
+    if (typeof result[key] === 'string') result[key] = normalizeTimestampString(result[key]);
+  }
   try { if (result.wave && typeof result.wave === 'string') result.wave = result.wave.replace(/wave /gi, ''); } catch (e) {}
   try { if (result.brand && typeof result.brand === 'string') result.brand = result.brand.toUpperCase(); } catch (e) {}
   try { if (result.campaign && typeof result.campaign === 'string') result.campaign = result.campaign.trim(); } catch (e) {}

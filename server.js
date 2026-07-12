@@ -28,12 +28,19 @@ process.env.DATALAKE_INT_SCHEMA = process.env.DATALAKE_INT_SCHEMA || 'hive_metas
 // Local data mode: when no Databricks token is configured (or LOCAL_DATA=1),
 // serve rows from data/*.csv — dummy data from scripts/generate-mock-data.mjs
 // or real exports from scripts/export-combined-csv.js. LOCAL_DATA=0 forces off.
+// DATA_MODE=live|local is the preferred explicit switch for development —
+// it takes priority over LOCAL_DATA and the token-presence auto-detection.
 const LOCAL_DATA_DIR = path.resolve(process.cwd(), 'data');
 // Assigning undefined to process.env (the default lines above) stores the
 // literal string "undefined", so treat that as an absent token here.
 const hasDatabricksToken = [process.env.DATABRICKS_TOKEN, process.env.DATABRICKS_INT_TOKEN]
   .some((t) => t && t !== 'undefined');
-const LOCAL_DATA_MODE = process.env.LOCAL_DATA === '1'
+const DATA_MODE_ENV = (process.env.DATA_MODE || '').trim().toLowerCase();
+const LOCAL_DATA_MODE = DATA_MODE_ENV === 'local'
+  ? true
+  : DATA_MODE_ENV === 'live'
+  ? false
+  : process.env.LOCAL_DATA === '1'
   || (process.env.LOCAL_DATA !== '0' && !hasDatabricksToken);
 
 function parseCsvText(text) {
@@ -131,14 +138,17 @@ if (LOCAL_DATA_MODE) {
     }
     const rows = loadLocalRows(LOCAL_ENDPOINT_ALIASES[name] || name);
     if (!rows) return next();
-    const limit = Math.min(5000, Number(req.query.limit) || 1000);
-    return res.json(rows.slice(0, limit));
+    const limit = Number(req.query.limit) || 0; // 0 = unlimited
+    return res.json(limit > 0 ? rows.slice(0, limit) : rows);
   });
 }
 
 // In-memory cache and SSE clients for live updates
-// Default refresh every 15s for more responsive dashboards (can override with env)
-const CACHE_REFRESH_INTERVAL_MS = Number(process.env.CACHE_REFRESH_INTERVAL_MS) || 15000;
+// Default refresh every 10 minutes: fact_main is now fetched unlimited (the
+// full table, not a 1000-row sample), so refreshing every 15s would hammer
+// the Databricks warehouse with a full-table scan four times a minute.
+// Override with CACHE_REFRESH_INTERVAL_MS.
+const CACHE_REFRESH_INTERVAL_MS = Number(process.env.CACHE_REFRESH_INTERVAL_MS) || 10 * 60 * 1000;
 const cache = {
   fact_main: { rows: [], updatedAt: 0 },
 };
@@ -183,7 +193,7 @@ async function refreshFactMainCache() {
     return;
   }
   try {
-    const rows = await queryFactMainCombined(1000);
+    const rows = await queryFactMainCombined(0); // 0 = unlimited, full table
     const now = Date.now();
     const prev = cache.fact_main.rows || [];
 
@@ -342,8 +352,21 @@ async function executeAgainstFirstAvailable(tableConfigOrName, queryBuilder) {
   throw lastError || new Error(`Table not found in any configured schema: ${tableName}`);
 }
 
+// Some Databricks timestamp columns come back with a comma or a colon
+// instead of a dot before the milliseconds (e.g. "13:38:00,000Z" or
+// "13:38:00:000Z" instead of "13:38:00.000Z"). Both are invalid per RFC
+// 3339/ISO 8601 — `Date` can't parse them, and a raw comma also forces CSV
+// quoting downstream. Repair it wherever it appears.
+function normalizeTimestampString(value) {
+  if (typeof value !== 'string') return value;
+  return value.replace(/(T\d{2}:\d{2}:\d{2})[,:](\d{3})(Z|[+-]\d{2}:?\d{2})?$/, '$1.$2$3');
+}
+
 function transformRow(row) {
   const result = Array.isArray(row) ? Object.assign({}, row) : { ...row };
+  for (const key of Object.keys(result)) {
+    if (typeof result[key] === 'string') result[key] = normalizeTimestampString(result[key]);
+  }
   try {
     if (result.wave && typeof result.wave === 'string') result.wave = result.wave.replace(/wave /gi, '');
   } catch (e) {}
@@ -387,11 +410,15 @@ function makeRowId(row) {
 async function queryTablesCombined(tableConfigs, limit = 100) {
   // Parallelize table probes to reduce total latency when querying multiple
   // source tables. Each table is fetched with per-table limit = `limit` and
-  // results are merged.
-  const perTableLimit = limit;
+  // results are merged. A limit of 0/falsy means unlimited (no LIMIT clause)
+  // — omitting the guard here would literally send `LIMIT 0` to Databricks.
+  const perTableLimit = limit && limit > 0 ? limit : undefined;
   const tasks = tableConfigs.map(async (t) => {
     try {
-      const result = await executeAgainstFirstAvailable(t.name, (fullName) => `SELECT * FROM ${fullName} LIMIT ${perTableLimit}`);
+      const result = await executeAgainstFirstAvailable(
+        t.name,
+        (fullName) => (perTableLimit ? `SELECT * FROM ${fullName} LIMIT ${perTableLimit}` : `SELECT * FROM ${fullName}`)
+      );
       const rows = [];
       for (const r of result.rows) {
         const row = transformRow(r);
@@ -431,7 +458,7 @@ async function queryTablesCombined(tableConfigs, limit = 100) {
 
   const results = await Promise.all(tasks);
   const combinedRows = results.flat();
-  return combinedRows.slice(0, limit);
+  return limit && limit > 0 ? combinedRows.slice(0, limit) : combinedRows;
 }
 
 async function queryFactMainCombined(limit = 100, skipEnrich = false) {
@@ -505,13 +532,16 @@ async function countTables(tableNames) {
 app.get("/api/fact_main_oru4_prod", async (req, res) => {
   try {
     // Prefer serving from cache for fast responses; fall back to a live
-    // query if cache is empty.
-    const limit = Math.min(1000, Number(req.query.limit) || 1000);
+    // query if cache is empty. Unlimited by default (0) — pass ?limit= to
+    // cap explicitly.
+    const limit = Number(req.query.limit) || 0;
     if (cache.fact_main && cache.fact_main.rows && cache.fact_main.rows.length) {
-      return res.json(cache.fact_main.rows.slice(0, limit));
+      return res.json(limit > 0 ? cache.fact_main.rows.slice(0, limit) : cache.fact_main.rows);
     }
-    // Return a small sample quickly while cache warms up.
-    const sampleLimit = Math.min(200, limit);
+    // Cache is still warming up: return a small sample quickly rather than
+    // block on a full unlimited query, unless the caller explicitly asked
+    // for a smaller/larger cap via ?limit=.
+    const sampleLimit = limit > 0 ? Math.min(200, limit) : 200;
     const rows = await queryFactMainCombined(sampleLimit, true);
     return res.json(rows);
   } catch (error) {
@@ -523,7 +553,7 @@ app.get("/api/fact_main_oru4_prod", async (req, res) => {
 // Also expose a combined endpoint name
 app.get("/api/fact_main_combined", async (req, res) => {
   try {
-    const limit = Math.min(1000, Number(req.query.limit) || 100);
+    const limit = Number(req.query.limit) || 0;
     const rows = await queryFactMainCombined(limit);
     res.json(rows);
   } catch (error) {
@@ -534,7 +564,7 @@ app.get("/api/fact_main_combined", async (req, res) => {
 
 app.get("/api/fact_main_eu_usca_combined", async (req, res) => {
   try {
-    const limit = Math.min(1000, Number(req.query.limit) || 100);
+    const limit = Number(req.query.limit) || 0;
     const rows = await queryFactMainEUwithUSCACombined(limit);
     res.json(rows);
   } catch (error) {
@@ -673,7 +703,7 @@ function enrichFactRows(rows, campaignRows, countryRows) {
 
 app.get("/api/fact_targeted_vehicles_combined", async (req, res) => {
   try {
-    const limit = Math.min(1000, Number(req.query.limit) || 100);
+    const limit = Number(req.query.limit) || 0; // 0 = unlimited
     const rows = await queryFactTargetedVehiclesCombined(limit);
     res.json(rows);
   } catch (error) {
@@ -684,7 +714,7 @@ app.get("/api/fact_targeted_vehicles_combined", async (req, res) => {
 
 app.get("/api/fact_adoption_rate_combined", async (req, res) => {
   try {
-    const limit = Math.min(1000, Number(req.query.limit) || 100);
+    const limit = Number(req.query.limit) || 0; // 0 = unlimited
     const rows = await queryFactAdoptionRateCombined(limit);
     res.json(rows);
   } catch (error) {
@@ -695,7 +725,7 @@ app.get("/api/fact_adoption_rate_combined", async (req, res) => {
 
 app.get("/api/fact_adoption_rate_eu_usca_combined", async (req, res) => {
   try {
-    const limit = Math.min(1000, Number(req.query.limit) || 100);
+    const limit = Number(req.query.limit) || 0; // 0 = unlimited
     const rows = await queryFactAdoptionRateEUwithUSCACombined(limit);
     res.json(rows);
   } catch (error) {
@@ -706,7 +736,7 @@ app.get("/api/fact_adoption_rate_eu_usca_combined", async (req, res) => {
 
 app.get("/api/fact_ecu_combined", async (req, res) => {
   try {
-    const limit = Math.min(1000, Number(req.query.limit) || 100);
+    const limit = Number(req.query.limit) || 0; // 0 = unlimited
     const rows = await queryFactEcuCombined(limit);
     res.json(rows);
   } catch (error) {
@@ -718,7 +748,7 @@ app.get("/api/fact_ecu_combined", async (req, res) => {
 // EU-only ECU combined endpoint
 app.get("/api/fact_ecu_eu_combined", async (req, res) => {
   try {
-    const limit = Math.min(1000, Number(req.query.limit) || 100);
+    const limit = Number(req.query.limit) || 0; // 0 = unlimited
     const rows = await queryFactEcuEUCombined(limit);
     res.json(rows);
   } catch (error) {
@@ -739,7 +769,7 @@ async function queryFactFrequencyEUwithUSCACombined(limit = 100) {
 
 app.get("/api/fact_frequency_eu_usca_combined", async (req, res) => {
   try {
-    const limit = Math.min(1000, Number(req.query.limit) || 100);
+    const limit = Number(req.query.limit) || 0; // 0 = unlimited
     const rows = await queryFactFrequencyEUwithUSCACombined(limit);
     res.json(rows);
   } catch (error) {
@@ -760,7 +790,7 @@ async function queryFactReleaseEUwithUSCACombined(limit = 100) {
 
 app.get("/api/fact_release_eu_usca_combined", async (req, res) => {
   try {
-    const limit = Math.min(1000, Number(req.query.limit) || 100);
+    const limit = Number(req.query.limit) || 0; // 0 = unlimited
     const rows = await queryFactReleaseEUwithUSCACombined(limit);
     res.json(rows);
   } catch (error) {
@@ -781,7 +811,7 @@ async function queryFactTargetedVehiclesEUwithUSCACombined(limit = 100) {
 
 app.get("/api/fact_targeted_vehicles_eu_usca_combined", async (req, res) => {
   try {
-    const limit = Math.min(1000, Number(req.query.limit) || 100);
+    const limit = Number(req.query.limit) || 0; // 0 = unlimited
     const rows = await queryFactTargetedVehiclesEUwithUSCACombined(limit);
     res.json(rows);
   } catch (error) {
@@ -792,7 +822,7 @@ app.get("/api/fact_targeted_vehicles_eu_usca_combined", async (req, res) => {
 
 app.get("/api/fact_release_combined", async (req, res) => {
   try {
-    const limit = Math.min(1000, Number(req.query.limit) || 100);
+    const limit = Number(req.query.limit) || 0; // 0 = unlimited
     const rows = await queryFactReleaseCombined(limit);
     res.json(rows);
   } catch (error) {
@@ -803,7 +833,7 @@ app.get("/api/fact_release_combined", async (req, res) => {
 
 app.get("/api/dim_campaign_combined", async (req, res) => {
   try {
-    const limit = Math.min(1000, Number(req.query.limit) || 100);
+    const limit = Number(req.query.limit) || 0; // 0 = unlimited
     const rows = await queryDimCampaignCombined(limit);
     res.json(rows);
   } catch (error) {
@@ -826,7 +856,7 @@ async function queryDimCampaignEUwithUSCANARCombined(limit = 100) {
 
 app.get("/api/dim_campaign_eu_usca_narch_combined", async (req, res) => {
   try {
-    const limit = Math.min(1000, Number(req.query.limit) || 100);
+    const limit = Number(req.query.limit) || 0; // 0 = unlimited
     const rows = await queryDimCampaignEUwithUSCANARCombined(limit);
     res.json(rows);
   } catch (error) {
@@ -837,7 +867,7 @@ app.get("/api/dim_campaign_eu_usca_narch_combined", async (req, res) => {
 
 app.get("/api/dim_country_combined", async (req, res) => {
   try {
-    const limit = Math.min(1000, Number(req.query.limit) || 100);
+    const limit = Number(req.query.limit) || 0; // 0 = unlimited
     const rows = await queryDimCountryCombined(limit);
     res.json(rows);
   } catch (error) {
@@ -874,7 +904,7 @@ async function queryDimCountryEUwithUSCANARCombined(limit = 100) {
 
 app.get("/api/dim_country_eu_usca_narch_combined", async (req, res) => {
   try {
-    const limit = Math.min(1000, Number(req.query.limit) || 100);
+    const limit = Number(req.query.limit) || 0; // 0 = unlimited
     const rows = await queryDimCountryEUwithUSCANARCombined(limit);
     res.json(rows);
   } catch (error) {
@@ -885,7 +915,7 @@ app.get("/api/dim_country_eu_usca_narch_combined", async (req, res) => {
 
 app.get("/api/fact_ai_summaries_latest", async (req, res) => {
   try {
-    const limit = Math.min(1000, Number(req.query.limit) || 100);
+    const limit = Number(req.query.limit) || 0; // 0 = unlimited
     const rows = await queryAiSummariesLatest(limit);
     res.json(rows);
   } catch (error) {

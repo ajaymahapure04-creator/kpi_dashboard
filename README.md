@@ -41,6 +41,10 @@ backend serves rows from `data/*.csv` instead of querying Databricks — the
 frontend works unchanged, including SSE live updates. Set `LOCAL_DATA=0` to
 force live mode.
 
+For an explicit, easier-to-remember switch during development, set
+`DATA_MODE=live` or `DATA_MODE=local` in `.env` — it takes priority over
+`LOCAL_DATA` and the token-presence auto-detection.
+
 ```bash
 npm run mock-data   # generate deterministic dummy CSVs into data/
 npm run dev-all     # backend picks them up automatically
@@ -78,12 +82,20 @@ The backend is implemented in `server.js`:
 Key environment variables used by `server.js`:
 
 - `PORT` — backend port (default `5001` if not set, matching the Vite proxy)
+- `DATA_MODE` — `live` or `local`, explicit override for local-data mode (see above)
 - `DATABRICKS_HOST_EU`, `DATABRICKS_PATH_EU`, `DATABRICKS_TOKEN_EU`
 - `DATABRICKS_INT_HOST`, `DATABRICKS_INT_PATH`, `DATABRICKS_INT_TOKEN`
 - `DATALAKE_PROD_SCHEMA` — default production schema
 - `DATALAKE_INT_SCHEMA` — default integration schema
 - `DATALAKE_DEV_SCHEMA` — default dev schema
-- `CACHE_REFRESH_INTERVAL_MS` — cache refresh interval in milliseconds
+- `CACHE_REFRESH_INTERVAL_MS` — cache refresh interval in milliseconds (default
+  10 minutes; the cache now fetches the full fact_main dataset unlimited, not
+  a 1000-row sample, so refreshing more often than that hits Databricks with
+  a full-table scan every cycle)
+
+All fact/dimension API routes are unlimited by default (every row from
+Databricks or `data/*.csv`) — pass `?limit=N` on a request to cap it
+explicitly for testing.
 
 The frontend proxy in `vite.config.js` forwards `/api` traffic to the backend.
 
