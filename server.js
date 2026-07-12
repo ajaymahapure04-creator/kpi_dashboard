@@ -465,12 +465,27 @@ async function queryFactMainEUwithUSCACombined(limit = 100) {
 }
 
 async function queryAiSummariesLatest(limit) {
-  const limitClause = limit ? `LIMIT ${limit}` : '';
   const result = await executeAgainstFirstAvailable(
     'fact_ai_summaries_facts_v3_int',
-    (fullName) => `SELECT * FROM ${fullName} WHERE generated_at = (SELECT MAX(generated_at) FROM ${fullName}) ${limitClause}`
+    (fullName) => `SELECT * FROM ${fullName}`
   );
-  return result.rows.map(transformRow);
+  const allRows = (result.rows || []).map(transformRow);
+  if (allRows.length === 0) return [];
+
+  // See scripts/export-combined-csv.js queryAiSummariesLatest for why this
+  // filters in JS instead of `WHERE generated_at = (SELECT MAX(...))`: NULL
+  // generated_at values make that SQL equality match nothing, and per-row
+  // (rather than per-batch) timestamps can make MAX() match only one row.
+  const validDates = allRows
+    .map((row) => row.generated_at)
+    .filter((v) => v !== null && v !== undefined && String(v).trim() !== '');
+  if (validDates.length === 0) {
+    console.warn('fact_ai_summaries_facts_v3_int: generated_at is empty on every row; returning all rows unfiltered.');
+    return limit ? allRows.slice(0, limit) : allRows;
+  }
+  const maxDate = validDates.reduce((max, v) => (String(v) > String(max) ? v : max));
+  const latestRows = allRows.filter((row) => row.generated_at === maxDate);
+  return limit ? latestRows.slice(0, limit) : latestRows;
 }
 
 async function countTables(tableNames) {

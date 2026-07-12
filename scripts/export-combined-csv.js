@@ -343,17 +343,35 @@ async function queryDimCountryEUwithUSCANARCombined(limit = 100) {
 }
 
 async function queryAiSummariesLatest(limit = 100) {
-  const limitClause = limit ? `LIMIT ${limit}` : '';
+  let result;
   try {
-    const result = await executeAgainstFirstAvailable(
+    result = await executeAgainstFirstAvailable(
       'fact_ai_summaries_facts_v3_int',
-      (fullName) => `SELECT * FROM ${fullName} WHERE generated_at = (SELECT MAX(generated_at) FROM ${fullName}) ${limitClause}`
+      (fullName) => `SELECT * FROM ${fullName}`
     );
-    const rows = (result && result.rows) ? result.rows : [];
-    return rows.map(transformRow);
   } catch (err) {
+    console.error('fact_ai_summaries_facts_v3_int: query failed on every configured schema/connection:', err && err.message ? err.message : err);
     return [];
   }
+  const allRows = ((result && result.rows) ? result.rows : []).map(transformRow);
+  if (allRows.length === 0) return [];
+
+  // Filter down to the latest run in JS rather than a SQL
+  // `WHERE generated_at = (SELECT MAX(...))` clause: if generated_at is
+  // NULL on any/all rows, that SQL equality matches nothing (NULL = NULL is
+  // never true), and if timestamps are per-row rather than per-batch, MAX()
+  // can match only a single row instead of the whole latest run — both
+  // silently produce an empty (blank) export.
+  const validDates = allRows
+    .map((row) => row.generated_at)
+    .filter((v) => v !== null && v !== undefined && String(v).trim() !== '');
+  if (validDates.length === 0) {
+    console.warn('fact_ai_summaries_facts_v3_int: generated_at is empty on every row; exporting all rows unfiltered.');
+    return limit ? allRows.slice(0, limit) : allRows;
+  }
+  const maxDate = validDates.reduce((max, v) => (String(v) > String(max) ? v : max));
+  const latestRows = allRows.filter((row) => row.generated_at === maxDate);
+  return limit ? latestRows.slice(0, limit) : latestRows;
 }
 
 function cleanObjectValue(value) {
