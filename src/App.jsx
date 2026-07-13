@@ -1925,8 +1925,6 @@ export default function App() {
         setBackendRows(Array.isArray(snapshot.fact_main) ? snapshot.fact_main : []);
         setCampaignRows(Array.isArray(snapshot.dim_campaign) ? snapshot.dim_campaign : []);
         setCountryRows(Array.isArray(snapshot.dim_country) ? snapshot.dim_country : []);
-        setReleaseRows(Array.isArray(snapshot.fact_release) ? snapshot.fact_release : []);
-        setAdoptionRows(Array.isArray(snapshot.fact_adoption_rate) ? snapshot.fact_adoption_rate : []);
         setAiSummaries(Array.isArray(snapshot.fact_ai_summaries_latest) ? snapshot.fact_ai_summaries_latest : []);
         setFilterCatalog(snapshot.filter_options || null);
         setDataMode(snapshot.mode || null);
@@ -1941,6 +1939,32 @@ export default function App() {
 
     fetchDashboardSnapshot();
   }, []);
+
+  // fact_release/fact_adoption_rate are row-level (not aggregated like
+  // fact_main) and only the DLCM Release pages need them. At real dataset
+  // scale, bundling them into the initial load pushed the total payload
+  // past what the browser tab could hold in memory at once (a hard crash,
+  // not a slow load) — so they're fetched on their own, only the first time
+  // a user actually opens a DLCM page.
+  const [dlcmLoading, setDlcmLoading] = useState(false);
+  const [dlcmLoaded, setDlcmLoaded] = useState(false);
+  const [dlcmError, setDlcmError] = useState(null);
+  useEffect(() => {
+    if (route.page !== "dlcm" || dlcmLoaded || dlcmLoading) return;
+    setDlcmLoading(true);
+    fetch("/api/dlcm_snapshot")
+      .then((response) => {
+        if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+        return response.json();
+      })
+      .then((snapshot) => {
+        setReleaseRows(Array.isArray(snapshot.fact_release) ? snapshot.fact_release : []);
+        setAdoptionRows(Array.isArray(snapshot.fact_adoption_rate) ? snapshot.fact_adoption_rate : []);
+        setDlcmLoaded(true);
+      })
+      .catch((error) => setDlcmError(error.message || String(error)))
+      .finally(() => setDlcmLoading(false));
+  }, [route.page, dlcmLoaded, dlcmLoading]);
 
   // Subscribe to WebSocket for live updates, fallback to SSE if needed
   useEffect(() => {
@@ -2069,10 +2093,12 @@ export default function App() {
             <Detail kpiId={route.kpiId} filters={filters} filteredRows={filteredRows}
               aiSummaries={aiSummaries} onBack={goHome} />
           )}
-          {route.page === "dlcm" && route.name === "Statistics" && (
+          {route.page === "dlcm" && dlcmLoading && <NoData label="Loading DLCM release data…" />}
+          {route.page === "dlcm" && dlcmError && <NoData label={`Backend error: ${dlcmError}`} />}
+          {route.page === "dlcm" && dlcmLoaded && route.name === "Statistics" && (
             <DlcmStatistics onBack={goHome} releaseRows={filteredReleaseRows} />
           )}
-          {route.page === "dlcm" && route.name === "Comparison" && (
+          {route.page === "dlcm" && dlcmLoaded && route.name === "Comparison" && (
             <DlcmComparison onBack={goHome} releaseRows={filteredReleaseRows} adoptionRows={filteredAdoptionRows} />
           )}
         </main>

@@ -134,65 +134,93 @@ function jsonArrayBuffer(rows) {
   return Buffer.concat(parts);
 }
 
-// Builds the full dashboard snapshot response as a Buffer (never a single JS
-// string) by concatenating each field's Buffer. fact_main/_enriched and the
-// *_enriched release/adoption fields are byte-identical to their non-
-// enriched counterparts, so the same Buffer is reused rather than built
-// twice.
-function buildSnapshotBuffer({ mode, factMainAgg, campaignRows, countryRows, releaseEnriched, adoptionEnriched, aiRows, filterOptions }) {
+// Builds the core dashboard snapshot response (everything the Overview and
+// KPI Detail pages need) as a Buffer, never a single JS string, by
+// concatenating each field's Buffer. fact_main and fact_main_enriched are
+// byte-identical, so the same Buffer is reused rather than built twice.
+// fact_release/fact_adoption_rate are deliberately NOT included here — they
+// stay row-level (not aggregated like fact_main) and only the DLCM Release
+// Statistics/Comparison pages need them, so they ship on their own endpoint
+// (see buildDlcmBuffer) fetched lazily only when a user opens those pages.
+// Bundling everything into one payload is what made a real-scale dataset
+// (500K+ aggregated fact_main rows plus proportionally larger release/
+// adoption tables) big enough to crash the browser tab outright once it
+// finally reached the frontend (see the Overview/DLCM split in App.jsx).
+function buildSnapshotBuffer({ mode, factMainAgg, campaignRows, countryRows, aiRows, filterOptions }) {
   const factMainBuf = jsonArrayBuffer(factMainAgg);
-  const releaseBuf = jsonArrayBuffer(releaseEnriched);
-  const adoptionBuf = jsonArrayBuffer(adoptionEnriched);
   return Buffer.concat([
     Buffer.from(`{"mode":${JSON.stringify(mode)}`, 'utf8'),
     Buffer.from(',"fact_main":', 'utf8'), factMainBuf,
     Buffer.from(',"fact_main_enriched":', 'utf8'), factMainBuf,
     Buffer.from(',"dim_campaign":', 'utf8'), jsonArrayBuffer(campaignRows),
     Buffer.from(',"dim_country":', 'utf8'), jsonArrayBuffer(countryRows),
-    Buffer.from(',"fact_release":', 'utf8'), releaseBuf,
-    Buffer.from(',"fact_release_enriched":', 'utf8'), releaseBuf,
-    Buffer.from(',"fact_adoption_rate":', 'utf8'), adoptionBuf,
-    Buffer.from(',"fact_adoption_rate_enriched":', 'utf8'), adoptionBuf,
     Buffer.from(',"fact_ai_summaries_latest":', 'utf8'), Buffer.from(JSON.stringify(aiRows), 'utf8'),
     Buffer.from(',"filter_options":', 'utf8'), Buffer.from(JSON.stringify(filterOptions), 'utf8'),
     Buffer.from('}', 'utf8'),
   ]);
 }
 
+// Same Buffer-not-string approach for the DLCM-only payload (fact_release +
+// fact_adoption_rate, row-level and enriched).
+function buildDlcmBuffer({ mode, releaseEnriched, adoptionEnriched }) {
+  const releaseBuf = jsonArrayBuffer(releaseEnriched);
+  const adoptionBuf = jsonArrayBuffer(adoptionEnriched);
+  return Buffer.concat([
+    Buffer.from(`{"mode":${JSON.stringify(mode)}`, 'utf8'),
+    Buffer.from(',"fact_release":', 'utf8'), releaseBuf,
+    Buffer.from(',"fact_release_enriched":', 'utf8'), releaseBuf,
+    Buffer.from(',"fact_adoption_rate":', 'utf8'), adoptionBuf,
+    Buffer.from(',"fact_adoption_rate_enriched":', 'utf8'), adoptionBuf,
+    Buffer.from('}', 'utf8'),
+  ]);
+}
+
 // In local mode the underlying files never change while the process is up, so
-// the whole snapshot (aggregated fact_main + dimensions + gzip bytes) is built
+// the core snapshot (aggregated fact_main + dimensions + gzip bytes) is built
 // once and reused. This turns every page load after the first into an instant
-// buffer write instead of re-reading/re-aggregating ~482 MB of JSON. Built
-// eagerly at startup (see buildLocalSnapshot() call below) so the slow
+// buffer write instead of re-reading/re-aggregating hundreds of MB of JSON.
+// Built eagerly at startup (see buildLocalSnapshot() call below) so the slow
 // aggregation happens once at boot instead of blocking whichever browser
 // request happens to arrive first.
 let localSnapshotJsonCache = null;
+// The DLCM payload (fact_release/fact_adoption_rate) is built lazily on
+// first request, not pre-warmed — most sessions never open those pages, so
+// there's no reason to pay that cost (or hold that memory) at every boot.
+let localDlcmSnapshotCache = null;
 
 function buildLocalSnapshot() {
   const snapshot = loadLocalDashboardSnapshot(localDataCache);
   const factMainRows = Array.isArray(snapshot.fact_main) ? snapshot.fact_main : [];
   const campaignRows = Array.isArray(snapshot.dim_campaign) ? snapshot.dim_campaign : [];
   const countryRows = Array.isArray(snapshot.dim_country) ? snapshot.dim_country : [];
-  const releaseRows = Array.isArray(snapshot.fact_release) ? snapshot.fact_release : [];
-  const adoptionRows = Array.isArray(snapshot.fact_adoption_rate) ? snapshot.fact_adoption_rate : [];
   const aiRows = Array.isArray(snapshot.fact_ai_summaries_latest) ? snapshot.fact_ai_summaries_latest : [];
 
   // fact_main is aggregated to a compact cube; the browser reconstructs
   // every KPI/series/delta from the pre-summed components (see App.jsx
-  // valueForKpi). release/adoption stay row-level — they're small and
-  // the DLCM views need per-campaign/per-date granularity.
+  // valueForKpi).
   const factMainAgg = buildFactMainAggregate(factMainRows, campaignRows, countryRows);
-  const releaseEnriched = enrichFactRows(releaseRows, campaignRows, countryRows);
-  const adoptionEnriched = enrichFactRows(adoptionRows, campaignRows, countryRows);
   const filterOptions = buildDashboardFilterCatalog(factMainAgg, campaignRows, countryRows);
 
-  const buf = buildSnapshotBuffer({
-    mode: 'local', factMainAgg, campaignRows, countryRows,
-    releaseEnriched, adoptionEnriched, aiRows, filterOptions,
-  });
+  const buf = buildSnapshotBuffer({ mode: 'local', factMainAgg, campaignRows, countryRows, aiRows, filterOptions });
   localSnapshotJsonCache = { gzip: zlib.gzipSync(buf) };
   console.log(`Local snapshot built: fact_main ${factMainRows.length} rows -> ${factMainAgg.length} aggregated cube rows (${(localSnapshotJsonCache.gzip.length / 1e6).toFixed(1)} MB gzipped).`);
   return localSnapshotJsonCache;
+}
+
+function buildLocalDlcmSnapshot() {
+  const snapshot = loadLocalDashboardSnapshot(localDataCache);
+  const campaignRows = Array.isArray(snapshot.dim_campaign) ? snapshot.dim_campaign : [];
+  const countryRows = Array.isArray(snapshot.dim_country) ? snapshot.dim_country : [];
+  const releaseRows = Array.isArray(snapshot.fact_release) ? snapshot.fact_release : [];
+  const adoptionRows = Array.isArray(snapshot.fact_adoption_rate) ? snapshot.fact_adoption_rate : [];
+
+  const releaseEnriched = enrichFactRows(releaseRows, campaignRows, countryRows);
+  const adoptionEnriched = enrichFactRows(adoptionRows, campaignRows, countryRows);
+
+  const buf = buildDlcmBuffer({ mode: 'local', releaseEnriched, adoptionEnriched });
+  localDlcmSnapshotCache = { gzip: zlib.gzipSync(buf) };
+  console.log(`Local DLCM snapshot built: fact_release ${releaseEnriched.length} rows, fact_adoption_rate ${adoptionEnriched.length} rows (${(localDlcmSnapshotCache.gzip.length / 1e6).toFixed(1)} MB gzipped).`);
+  return localDlcmSnapshotCache;
 }
 
 app.get('/api/dashboard_snapshot', async (req, res) => {
@@ -202,24 +230,47 @@ app.get('/api/dashboard_snapshot', async (req, res) => {
       return sendJsonMaybeGzip(req, res, localSnapshotJsonCache);
     }
 
-    const [factMainRows, campaignRows, countryRows, releaseRows, adoptionRows, aiRows] = await Promise.all([
+    const [factMainRows, campaignRows, countryRows, aiRows] = await Promise.all([
       queryFactMainCombined(0, true),
       queryDimCampaignCombined(0),
       queryDimCountryCombined(0),
-      queryFactReleaseCombined(0),
-      queryFactAdoptionRateCombined(0),
       queryAiSummariesLatest(0),
     ]);
 
     const factMainEnriched = enrichFactRows(factMainRows, campaignRows, countryRows);
-    const releaseEnriched = enrichFactRows(releaseRows, campaignRows, countryRows);
-    const adoptionEnriched = enrichFactRows(adoptionRows, campaignRows, countryRows);
     const filterOptions = buildDashboardFilterCatalog(factMainRows, campaignRows, countryRows);
 
     const buf = buildSnapshotBuffer({
-      mode: 'live', factMainAgg: factMainEnriched, campaignRows, countryRows,
-      releaseEnriched, adoptionEnriched, aiRows, filterOptions,
+      mode: 'live', factMainAgg: factMainEnriched, campaignRows, countryRows, aiRows, filterOptions,
     });
+    return sendJsonMaybeGzip(req, res, { gzip: zlib.gzipSync(buf) });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: error.message || String(error), stack: error.stack });
+  }
+});
+
+// Row-level fact_release/fact_adoption_rate, fetched only when a user opens
+// a DLCM Release page — see the comment on buildSnapshotBuffer for why this
+// isn't part of /api/dashboard_snapshot.
+app.get('/api/dlcm_snapshot', async (req, res) => {
+  try {
+    if (LOCAL_DATA_MODE) {
+      if (!localDlcmSnapshotCache) buildLocalDlcmSnapshot();
+      return sendJsonMaybeGzip(req, res, localDlcmSnapshotCache);
+    }
+
+    const [campaignRows, countryRows, releaseRows, adoptionRows] = await Promise.all([
+      queryDimCampaignCombined(0),
+      queryDimCountryCombined(0),
+      queryFactReleaseCombined(0),
+      queryFactAdoptionRateCombined(0),
+    ]);
+
+    const releaseEnriched = enrichFactRows(releaseRows, campaignRows, countryRows);
+    const adoptionEnriched = enrichFactRows(adoptionRows, campaignRows, countryRows);
+
+    const buf = buildDlcmBuffer({ mode: 'live', releaseEnriched, adoptionEnriched });
     return sendJsonMaybeGzip(req, res, { gzip: zlib.gzipSync(buf) });
   } catch (error) {
     console.error(error);
