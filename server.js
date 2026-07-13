@@ -818,8 +818,22 @@ async function queryDimCountryCombined(limit = 100) {
   return queryDimCountryEUwithUSCANARCombined(limit);
 }
 
+// Local CSV exports sometimes wrap string cells in stray quotes (the same
+// artifact normalizeAggDate works around for timestamps — e.g. a
+// country_iso cell literally containing `"DE"` including the quote chars).
+// A join key that isn't normalized this way silently fails to match its
+// lookup Map on one side only, so the affected field resolves to "" for
+// every row instead of throwing — region/country_name broke exactly this
+// way while brand/platform/recall (joined via `campaign`, unaffected by
+// the quoting) kept working, which is why "every filter except Region"
+// was the symptom rather than an outright error.
+function normalizeJoinKey(value) {
+  if (value === undefined || value === null) return "";
+  return String(value).trim().replace(/^"+|"+$/g, "");
+}
+
 function normalizeFactCampaignKey(row) {
-  return row.campaign ?? row.Campaign ?? row.campaign_id ?? row.id ?? row.name ?? "";
+  return normalizeJoinKey(row.campaign ?? row.Campaign ?? row.campaign_id ?? row.id ?? row.name ?? "");
 }
 
 function buildFactCampaignLookup(rows) {
@@ -841,7 +855,7 @@ function buildFactCampaignLookup(rows) {
 function buildFactCountryLookup(rows) {
   const lookup = new Map();
   for (const row of rows) {
-    const iso = row.country_iso ?? row.iso ?? row.id;
+    const iso = normalizeJoinKey(row.country_iso ?? row.iso ?? row.id);
     if (!iso) continue;
     lookup.set(iso, {
       country_name: row.country_name ?? row.country ?? undefined,
@@ -858,7 +872,7 @@ function enrichFactRows(rows, campaignRows, countryRows) {
   return rows.map((row) => {
     const campaignKey = normalizeFactCampaignKey(row);
     const dimCampaign = campaignLookup.get(campaignKey);
-    const countryIso = row.country_iso ?? row.country ?? row.iso;
+    const countryIso = normalizeJoinKey(row.country_iso ?? row.country ?? row.iso);
     const dimCountry = countryIso ? countryLookup.get(countryIso) : undefined;
 
     const enriched = { ...row };
@@ -909,7 +923,7 @@ function buildFactMainAggregate(factRows, campaignRows, countryRows) {
   for (const row of factRows) {
     const campaignKey = normalizeFactCampaignKey(row);
     const dimCampaign = campaignLookup.get(campaignKey) || {};
-    const countryIso = row.country_iso ?? row.country ?? row.iso;
+    const countryIso = normalizeJoinKey(row.country_iso ?? row.country ?? row.iso);
     const dimCountry = (countryIso ? countryLookup.get(countryIso) : undefined) || {};
 
     const brand = row.brand || dimCampaign.brand || '';
