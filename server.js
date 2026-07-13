@@ -106,46 +106,52 @@ function sendJsonMaybeGzip(req, res, payload) {
 // In local mode the underlying files never change while the process is up, so
 // the whole snapshot (aggregated fact_main + dimensions + gzip bytes) is built
 // once and reused. This turns every page load after the first into an instant
-// buffer write instead of re-reading/re-aggregating ~482 MB of JSON.
+// buffer write instead of re-reading/re-aggregating ~482 MB of JSON. Built
+// eagerly at startup (see buildLocalSnapshot() call below) so the slow
+// aggregation happens once at boot instead of blocking whichever browser
+// request happens to arrive first.
 let localSnapshotJsonCache = null;
+
+function buildLocalSnapshot() {
+  const snapshot = loadLocalDashboardSnapshot(localDataCache);
+  const factMainRows = Array.isArray(snapshot.fact_main) ? snapshot.fact_main : [];
+  const campaignRows = Array.isArray(snapshot.dim_campaign) ? snapshot.dim_campaign : [];
+  const countryRows = Array.isArray(snapshot.dim_country) ? snapshot.dim_country : [];
+  const releaseRows = Array.isArray(snapshot.fact_release) ? snapshot.fact_release : [];
+  const adoptionRows = Array.isArray(snapshot.fact_adoption_rate) ? snapshot.fact_adoption_rate : [];
+  const aiRows = Array.isArray(snapshot.fact_ai_summaries_latest) ? snapshot.fact_ai_summaries_latest : [];
+
+  // fact_main is aggregated to a compact cube; the browser reconstructs
+  // every KPI/series/delta from the pre-summed components (see App.jsx
+  // valueForKpi). release/adoption stay row-level — they're small and
+  // the DLCM views need per-campaign/per-date granularity.
+  const factMainAgg = buildFactMainAggregate(factMainRows, campaignRows, countryRows);
+  const releaseEnriched = enrichFactRows(releaseRows, campaignRows, countryRows);
+  const adoptionEnriched = enrichFactRows(adoptionRows, campaignRows, countryRows);
+  const filterOptions = buildDashboardFilterCatalog(factMainAgg, campaignRows, countryRows);
+
+  const json = JSON.stringify({
+    mode: 'local',
+    fact_main: factMainAgg,
+    fact_main_enriched: factMainAgg,
+    dim_campaign: campaignRows,
+    dim_country: countryRows,
+    fact_release: releaseEnriched,
+    fact_release_enriched: releaseEnriched,
+    fact_adoption_rate: adoptionEnriched,
+    fact_adoption_rate_enriched: adoptionEnriched,
+    fact_ai_summaries_latest: aiRows,
+    filter_options: filterOptions,
+  });
+  localSnapshotJsonCache = { json, gzip: zlib.gzipSync(json) };
+  console.log(`Local snapshot built: fact_main ${factMainRows.length} rows -> ${factMainAgg.length} aggregated cube rows (${(localSnapshotJsonCache.gzip.length / 1e6).toFixed(1)} MB gzipped).`);
+  return localSnapshotJsonCache;
+}
 
 app.get('/api/dashboard_snapshot', async (req, res) => {
   try {
     if (LOCAL_DATA_MODE) {
-      if (!localSnapshotJsonCache) {
-        const snapshot = loadLocalDashboardSnapshot(localDataCache);
-        const factMainRows = Array.isArray(snapshot.fact_main) ? snapshot.fact_main : [];
-        const campaignRows = Array.isArray(snapshot.dim_campaign) ? snapshot.dim_campaign : [];
-        const countryRows = Array.isArray(snapshot.dim_country) ? snapshot.dim_country : [];
-        const releaseRows = Array.isArray(snapshot.fact_release) ? snapshot.fact_release : [];
-        const adoptionRows = Array.isArray(snapshot.fact_adoption_rate) ? snapshot.fact_adoption_rate : [];
-        const aiRows = Array.isArray(snapshot.fact_ai_summaries_latest) ? snapshot.fact_ai_summaries_latest : [];
-
-        // fact_main is aggregated to a compact cube; the browser reconstructs
-        // every KPI/series/delta from the pre-summed components (see App.jsx
-        // valueForKpi). release/adoption stay row-level — they're small and
-        // the DLCM views need per-campaign/per-date granularity.
-        const factMainAgg = buildFactMainAggregate(factMainRows, campaignRows, countryRows);
-        const releaseEnriched = enrichFactRows(releaseRows, campaignRows, countryRows);
-        const adoptionEnriched = enrichFactRows(adoptionRows, campaignRows, countryRows);
-        const filterOptions = buildDashboardFilterCatalog(factMainAgg, campaignRows, countryRows);
-
-        const json = JSON.stringify({
-          mode: 'local',
-          fact_main: factMainAgg,
-          fact_main_enriched: factMainAgg,
-          dim_campaign: campaignRows,
-          dim_country: countryRows,
-          fact_release: releaseEnriched,
-          fact_release_enriched: releaseEnriched,
-          fact_adoption_rate: adoptionEnriched,
-          fact_adoption_rate_enriched: adoptionEnriched,
-          fact_ai_summaries_latest: aiRows,
-          filter_options: filterOptions,
-        });
-        localSnapshotJsonCache = { json, gzip: zlib.gzipSync(json) };
-        console.log(`Local snapshot built: fact_main ${factMainRows.length} rows -> ${factMainAgg.length} aggregated cube rows (${(localSnapshotJsonCache.gzip.length / 1e6).toFixed(1)} MB gzipped).`);
-      }
+      if (!localSnapshotJsonCache) buildLocalSnapshot();
       return sendJsonMaybeGzip(req, res, localSnapshotJsonCache);
     }
 
@@ -185,6 +191,13 @@ app.get('/api/dashboard_snapshot', async (req, res) => {
 if (LOCAL_DATA_MODE) {
   console.log(`Local data mode: serving rows from ${LOCAL_DATA_DIR} (no Databricks connection). JSON snapshots are preferred; CSV files are still supported.`);
   generateLocalJsonFilesFromCsvs();
+  // Pre-warm the aggregated snapshot now, before the port opens, so the
+  // one-time aggregation cost lands at boot instead of stalling the first
+  // browser to load the dashboard.
+  console.log('Pre-warming local dashboard snapshot (this can take a while for large datasets)...');
+  const warmupStartedAt = Date.now();
+  buildLocalSnapshot();
+  console.log(`Snapshot pre-warm finished in ${((Date.now() - warmupStartedAt) / 1000).toFixed(1)}s.`);
   app.use('/api', (req, res, next) => {
     const name = req.path.replace(/^\/+/, '');
     if (name === 'table_counts') {

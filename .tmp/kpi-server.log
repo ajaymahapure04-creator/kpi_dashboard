@@ -1,4 +1,0 @@
-◇ injected env (9) from .env // tip: ◈ encrypted .env [www.dotenvx.com]
-Local data mode: serving rows from C:\Data\Important\kpi_dashboard\data (no Databricks connection). JSON snapshots are preferred; CSV files are still supported.
-Backend listening on http://localhost:5001
-Local snapshot built: fact_main 1006753 rows -> 126211 aggregated cube rows (19.8 MB gzipped).
