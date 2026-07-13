@@ -586,8 +586,49 @@ function formatLargeNumber(value) {
   return `${value.toFixed(1)}`;
 }
 
+// In local mode the backend ships fact_main pre-aggregated into a cube whose
+// rows carry summed components (marked `_agg`) rather than raw per-event
+// fields. Because every KPI is a sum or a ratio-of-sums, the exact
+// whole-dataset value, per-day series value and windowed delta all
+// reconstruct from those sums — so this branch produces identical numbers to
+// the raw-row path below, over a dataset ~1000x smaller.
+function valueForKpiAgg(rows, kpiId) {
+  const sum = (key) => rows.reduce((a, r) => a + (Number(r[key]) || 0), 0);
+  switch (kpiId) {
+    case "updates":
+      return sum("successful_updates");
+    case "quality": {
+      const totalUpdates = sum("successful_updates");
+      if (totalUpdates) return sum("_quality_weight") / totalUpdates;
+      const n = sum("_n");
+      return n ? sum("_quality_sum") / n : null;
+    }
+    case "liegenbleiber": {
+      const totalUpdates = sum("successful_updates");
+      const totalWarnings = sum("customerWarning_minor") + sum("customerWarning_major");
+      return totalUpdates ? (totalWarnings / totalUpdates) * 1000 : null;
+    }
+    case "adoption": {
+      const installs = sum("update_operations");
+      const eligible = sum("lb_common_vehicles") + sum("lb_backend_vehicles") + sum("lb_aftersales_vehicles");
+      return eligible ? (installs / eligible) * 100 : null;
+    }
+    case "duration": {
+      const n = sum("_n");
+      return n ? sum("downtime_minutes") / n : null;
+    }
+    case "cost":
+      return sum("cost_savings");
+    case "co2":
+      return sum("co2_savings");
+    default:
+      return null;
+  }
+}
+
 function valueForKpi(rows, kpiId) {
   if (!rows || !rows.length) return null;
+  if (rows[0] && rows[0]._agg) return valueForKpiAgg(rows, kpiId);
   switch (kpiId) {
     case "updates":
       return sumField(rows, ["successful_updates"]);
@@ -1129,8 +1170,19 @@ function Select({ label, value, options, onChange }) {
   );
 }
 
-function FilterBar({ filters, setFilters, regionCountryMap, brandOptions, platformOptions, recallOptions, enrichedRows }) {
-  const available = getAvailableDimensionOptions(filters, enrichedRows);
+function FilterBar({ filters, setFilters, regionCountryMap, brandOptions, platformOptions, recallOptions, enrichedRows, filterCatalog }) {
+  const available = useMemo(() => {
+    if (filterCatalog) {
+      return {
+        region: new Set(filterCatalog.regions || []),
+        country: new Set(filterCatalog.countries || []),
+        brand: new Set(filterCatalog.brands || []),
+        platform: new Set(filterCatalog.platforms || []),
+        recall: new Set(filterCatalog.recalls || []),
+      };
+    }
+    return getAvailableDimensionOptions(filters, enrichedRows);
+  }, [filterCatalog, filters, enrichedRows]);
   const set = (k) => (v) => setFilters((f) => ({ ...f, [k]: v }));
   // A change in one dimension re-cascades the others using actual dimension availability.
   const setDim = (dim) => (vals) => setFilters((f) => {
@@ -1803,24 +1855,31 @@ export default function App() {
   const [backendLoading, setBackendLoading] = useState(true);
   const [dimensionError, setDimensionError] = useState(null);
   const [dimensionLoading, setDimensionLoading] = useState(true);
+  const [filterCatalog, setFilterCatalog] = useState(null);
 
   const brandOptions = useMemo(
-    () => uniqueDimValues(campaignRows, normalizeBrandValue),
+    () => (filterCatalog?.brands?.length ? filterCatalog.brands : uniqueDimValues(campaignRows, normalizeBrandValue)),
     [campaignRows]
   );
 
   const platformOptions = useMemo(
-    () => uniqueDimValues(campaignRows, normalizePlatformValue),
-    [campaignRows]
+    () => (filterCatalog?.platforms?.length ? filterCatalog.platforms : uniqueDimValues(campaignRows, normalizePlatformValue)),
+    [campaignRows, filterCatalog]
   );
 
   const recallOptions = useMemo(
-    () => uniqueDimValues(campaignRows, normalizeRecallValue),
-    [campaignRows]
+    () => (filterCatalog?.recalls?.length ? filterCatalog.recalls : uniqueDimValues(campaignRows, normalizeRecallValue)),
+    [campaignRows, filterCatalog]
   );
 
   // Region -> its countries, for the nested Region/Country filter control.
   const regionCountryMap = useMemo(() => {
+    if (filterCatalog?.regionCountryMap) {
+      const map = new Map();
+      Object.entries(filterCatalog.regionCountryMap).forEach(([region, countries]) => map.set(region, countries));
+      return map;
+    }
+
     const map = new Map();
     for (const row of countryRows) {
       const region = normalizeRegionValue(row);
@@ -1831,7 +1890,7 @@ export default function App() {
     }
     for (const list of map.values()) list.sort();
     return map;
-  }, [countryRows]);
+  }, [countryRows, filterCatalog]);
 
   const countryLookup = useMemo(
     () => buildCountryLookup(countryRows),
@@ -1847,25 +1906,29 @@ export default function App() {
   // `campaign` and to dim_country via `country_iso` — so region/country/
   // brand/platform/recall filtering (and the date range) works uniformly
   // across fact_main, fact_release, and fact_adoption_rate.
-  const enrichedRows = useMemo(
-    () => backendRows.map((row) => enrichRow(row, campaignLookup, countryLookup)),
-    [backendRows, campaignLookup, countryLookup]
-  );
+  const enrichedRows = useMemo(() => {
+    const looksPreEnriched = backendRows.some((row) => row.brand !== undefined || row.country_name !== undefined || row.region !== undefined || row.recall !== undefined);
+    return looksPreEnriched ? backendRows : backendRows.map((row) => enrichRow(row, campaignLookup, countryLookup));
+  }, [backendRows, campaignLookup, countryLookup]);
 
   const filteredRows = useMemo(
     () => enrichedRows.filter((row) => matchesRowFilters(row, filters)),
     [enrichedRows, filters]
   );
 
-  const filteredReleaseRows = useMemo(
-    () => releaseRows.map((row) => enrichRow(row, campaignLookup, countryLookup)).filter((row) => matchesRowFilters(row, filters)),
-    [releaseRows, campaignLookup, countryLookup, filters]
-  );
+  const filteredReleaseRows = useMemo(() => {
+    const rows = releaseRows.some((row) => row.brand !== undefined || row.country_name !== undefined || row.region !== undefined || row.recall !== undefined)
+      ? releaseRows
+      : releaseRows.map((row) => enrichRow(row, campaignLookup, countryLookup));
+    return rows.filter((row) => matchesRowFilters(row, filters));
+  }, [releaseRows, campaignLookup, countryLookup, filters]);
 
-  const filteredAdoptionRows = useMemo(
-    () => adoptionRows.map((row) => enrichRow(row, campaignLookup, countryLookup)).filter((row) => matchesRowFilters(row, filters)),
-    [adoptionRows, campaignLookup, countryLookup, filters]
-  );
+  const filteredAdoptionRows = useMemo(() => {
+    const rows = adoptionRows.some((row) => row.brand !== undefined || row.country_name !== undefined || row.region !== undefined || row.recall !== undefined)
+      ? adoptionRows
+      : adoptionRows.map((row) => enrichRow(row, campaignLookup, countryLookup));
+    return rows.filter((row) => matchesRowFilters(row, filters));
+  }, [adoptionRows, campaignLookup, countryLookup, filters]);
 
   useEffect(() => {
     localStorage.setItem("ota-nav-open", String(navOpen));
@@ -1891,67 +1954,29 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const fetchBackendData = async () => {
+    const fetchDashboardSnapshot = async () => {
       try {
-        const response = await fetch("/api/fact_main_oru4_prod");
+        const response = await fetch("/api/dashboard_snapshot");
         if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
-        const data = await response.json();
-        setBackendRows(data);
+        const snapshot = await response.json();
+        setBackendRows(Array.isArray(snapshot.fact_main) ? snapshot.fact_main : []);
+        setCampaignRows(Array.isArray(snapshot.dim_campaign) ? snapshot.dim_campaign : []);
+        setCountryRows(Array.isArray(snapshot.dim_country) ? snapshot.dim_country : []);
+        setReleaseRows(Array.isArray(snapshot.fact_release) ? snapshot.fact_release : []);
+        setAdoptionRows(Array.isArray(snapshot.fact_adoption_rate) ? snapshot.fact_adoption_rate : []);
+        setAiSummaries(Array.isArray(snapshot.fact_ai_summaries_latest) ? snapshot.fact_ai_summaries_latest : []);
+        setFilterCatalog(snapshot.filter_options || null);
+        setDataMode(snapshot.mode || null);
       } catch (error) {
         setBackendError(error.message || String(error));
-      } finally {
-        setBackendLoading(false);
-      }
-    };
-
-    const fetchDimensionData = async () => {
-      try {
-        const [campaignRes, countryRes] = await Promise.all([
-          fetch("/api/dim_campaign_combined"),
-          fetch("/api/dim_country_combined"),
-        ]);
-        if (!campaignRes.ok) throw new Error(`Campaign fetch failed: ${campaignRes.status} ${campaignRes.statusText}`);
-        if (!countryRes.ok) throw new Error(`Country fetch failed: ${countryRes.status} ${countryRes.statusText}`);
-        const [campaignData, countryData] = await Promise.all([campaignRes.json(), countryRes.json()]);
-        setCampaignRows(campaignData);
-        setCountryRows(countryData);
-      } catch (error) {
         setDimensionError(error.message || String(error));
       } finally {
+        setBackendLoading(false);
         setDimensionLoading(false);
       }
     };
 
-    const fetchAuxiliaryData = async () => {
-      try {
-        const [releaseRes, adoptionRes, aiRes] = await Promise.all([
-          fetch("/api/fact_release_combined"),
-          fetch("/api/fact_adoption_rate_combined"),
-          fetch("/api/fact_ai_summaries_latest"),
-        ]);
-        if (releaseRes.ok) setReleaseRows(await releaseRes.json());
-        if (adoptionRes.ok) setAdoptionRows(await adoptionRes.json());
-        if (aiRes.ok) setAiSummaries(await aiRes.json());
-      } catch (error) {
-        console.info("Auxiliary data fetch failed; DLCM and insights use fallbacks", error);
-      }
-    };
-
-    // Reflects the backend's mode at startup (see server.js /api/status) —
-    // not a live health check, since switching modes needs a restart anyway.
-    const fetchStatus = async () => {
-      try {
-        const res = await fetch("/api/status");
-        if (res.ok) setDataMode((await res.json()).mode);
-      } catch (error) {
-        console.info("Status fetch failed; connection indicator stays hidden", error);
-      }
-    };
-
-    fetchBackendData();
-    fetchDimensionData();
-    fetchAuxiliaryData();
-    fetchStatus();
+    fetchDashboardSnapshot();
   }, []);
 
   // Subscribe to WebSocket for live updates, fallback to SSE if needed
@@ -2056,6 +2081,7 @@ export default function App() {
         platformOptions={platformOptions}
         recallOptions={recallOptions}
         enrichedRows={enrichedRows}
+        filterCatalog={filterCatalog}
       />
       <div className="flex-1 min-h-0 flex flex-row">
         <SideNav open={navOpen} onClose={() => setNavOpen(false)} route={route} onNavigate={setRoute}

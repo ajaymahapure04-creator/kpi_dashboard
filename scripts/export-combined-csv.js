@@ -363,11 +363,14 @@ async function queryAiSummariesLatest(limit = 100) {
       (fullName) => `SELECT * FROM ${fullName}`
     );
   } catch (err) {
-    console.error('fact_ai_summaries_facts_v3_int: query failed on every configured schema/connection:', err && err.message ? err.message : err);
-    return [];
+    console.warn('fact_ai_summaries_facts_v3_int: query failed, falling back to local CSV', err && err.message ? err.message : err);
+    return readLocalCsvRows('fact_ai_summaries_latest');
   }
   const allRows = ((result && result.rows) ? result.rows : []).map(transformRow);
-  if (allRows.length === 0) return [];
+  if (allRows.length === 0) {
+    const fallbackRows = readLocalCsvRows('fact_ai_summaries_latest');
+    return fallbackRows.length ? (limit ? fallbackRows.slice(0, limit) : fallbackRows) : [];
+  }
 
   // Filter down to the latest run in JS rather than a SQL
   // `WHERE generated_at = (SELECT MAX(...))` clause: if generated_at is
@@ -391,6 +394,57 @@ function cleanObjectValue(value) {
   if (value === null || value === undefined) return '';
   if (typeof value === 'object') return JSON.stringify(value);
   return String(value);
+}
+
+function detectDelimiter(text) {
+  const lines = text.split(/\r?\n/).filter((line) => line.trim() !== '');
+  if (!lines.length) return ',';
+  const first = lines[0];
+  const commaCount = (first.match(/,/g) || []).length;
+  const tabCount = (first.match(/\t/g) || []).length;
+  return tabCount > commaCount ? '\t' : ',';
+}
+
+function parseCsvText(text) {
+  const delimiter = detectDelimiter(text);
+  const records = [];
+  let field = '';
+  let row = [];
+  let inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (text[i + 1] === '"') { field += '"'; i++; }
+        else inQuotes = false;
+      } else field += ch;
+    } else if (ch === '"') inQuotes = true;
+    else if (ch === delimiter) { row.push(field); field = ''; }
+    else if (ch === '\n' || ch === '\r') {
+      if (ch === '\r' && text[i + 1] === '\n') i++;
+      row.push(field); field = '';
+      records.push(row); row = [];
+    } else field += ch;
+  }
+  if (field !== '' || row.length) { row.push(field); records.push(row); }
+  if (records.length < 2) return [];
+  const headers = records[0].map((h) => String(h).trim());
+  return records.slice(1)
+    .filter((r) => r.some((v) => v !== ''))
+    .map((r) => {
+      const obj = {};
+      headers.forEach((h, idx) => {
+        const v = r[idx];
+        if (v !== undefined && v !== '') obj[h] = v;
+      });
+      return obj;
+    });
+}
+
+function readLocalCsvRows(name) {
+  const filePath = path.join(DATA_DIR, `${name}.csv`);
+  if (!fs.existsSync(filePath)) return [];
+  return parseCsvText(fs.readFileSync(filePath, 'utf8'));
 }
 
 function rowsToCsv(rows) {

@@ -5,7 +5,9 @@ import dotenv from "dotenv";
 import http from "http";
 import fs from "fs";
 import path from "path";
+import zlib from "zlib";
 import { createRequire } from "module";
+import { LOCAL_DATA_DIR, loadLocalDataRows, loadLocalDashboardSnapshot, generateLocalJsonFilesFromCsvs } from './scripts/local-data-utils.mjs';
 
 const require = createRequire(import.meta.url);
 const { Server: WebSocketServer } = require("ws");
@@ -26,11 +28,11 @@ process.env.DATABRICKS_INT_TOKEN = process.env.DATABRICKS_INT_TOKEN || process.e
 process.env.DATALAKE_INT_SCHEMA = process.env.DATALAKE_INT_SCHEMA || 'hive_metastore.datalake_int';
 
 // Local data mode: when no Databricks token is configured (or LOCAL_DATA=1),
-// serve rows from data/*.csv — dummy data from scripts/generate-mock-data.mjs
-// or real exports from scripts/export-combined-csv.js. LOCAL_DATA=0 forces off.
+// serve rows from data/*.json when available, falling back to data/*.csv.
+// CSV remains the source/export format for compatibility, and JSON is treated
+// as a fast local cache generated from CSVs. LOCAL_DATA=0 forces off.
 // DATA_MODE=live|local is the preferred explicit switch for development —
 // it takes priority over LOCAL_DATA and the token-presence auto-detection.
-const LOCAL_DATA_DIR = path.resolve(process.cwd(), 'data');
 // Assigning undefined to process.env (the default lines above) stores the
 // literal string "undefined", so treat that as an absent token here.
 const hasDatabricksToken = [process.env.DATABRICKS_TOKEN, process.env.DATABRICKS_INT_TOKEN]
@@ -43,49 +45,9 @@ const LOCAL_DATA_MODE = DATA_MODE_ENV === 'local'
   : process.env.LOCAL_DATA === '1'
   || (process.env.LOCAL_DATA !== '0' && !hasDatabricksToken);
 
-function parseCsvText(text) {
-  const records = [];
-  let field = '';
-  let row = [];
-  let inQuotes = false;
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i];
-    if (inQuotes) {
-      if (ch === '"') {
-        if (text[i + 1] === '"') { field += '"'; i++; }
-        else inQuotes = false;
-      } else field += ch;
-    } else if (ch === '"') inQuotes = true;
-    else if (ch === ',') { row.push(field); field = ''; }
-    else if (ch === '\n' || ch === '\r') {
-      if (ch === '\r' && text[i + 1] === '\n') i++;
-      row.push(field); field = '';
-      records.push(row); row = [];
-    } else field += ch;
-  }
-  if (field !== '' || row.length) { row.push(field); records.push(row); }
-  if (records.length < 2) return [];
-  const headers = records[0];
-  return records.slice(1)
-    .filter((r) => r.some((v) => v !== ''))
-    .map((r) => {
-      const obj = {};
-      headers.forEach((h, idx) => {
-        const v = r[idx];
-        if (v !== undefined && v !== '') obj[h] = v;
-      });
-      return obj;
-    });
-}
-
-const localCsvCache = new Map();
+const localDataCache = new Map();
 function loadLocalRows(name) {
-  if (localCsvCache.has(name)) return localCsvCache.get(name);
-  const filePath = path.join(LOCAL_DATA_DIR, `${name}.csv`);
-  let rows = null;
-  if (fs.existsSync(filePath)) rows = parseCsvText(fs.readFileSync(filePath, 'utf8'));
-  localCsvCache.set(name, rows);
-  return rows;
+  return loadLocalDataRows(name, localDataCache);
 }
 
 // Every API route maps onto one of the 8 canonical CSVs — each file is
@@ -121,16 +83,116 @@ app.get('/api/status', (req, res) => {
   res.json({ mode: LOCAL_DATA_MODE ? 'local' : 'live' });
 });
 
+// Serialize once, gzip once, and send with the right Content-Encoding when
+// the client accepts it. The dashboard snapshot is large (dimension rows plus
+// aggregated facts), highly repetitive JSON, so gzip typically shrinks it ~10x
+// — the single biggest lever on perceived load time in local mode.
+function sendJsonMaybeGzip(req, res, payload) {
+  // `payload` may be a raw JSON string or a { json, gzip } pair carrying a
+  // pre-computed gzip buffer (used for the cached local snapshot so we never
+  // re-compress ~300 MB per request).
+  const json = typeof payload === 'string' ? payload : payload.json;
+  const accepts = String(req.headers['accept-encoding'] || '').includes('gzip');
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  if (accepts) {
+    const gz = typeof payload === 'string' ? zlib.gzipSync(json) : payload.gzip;
+    res.setHeader('Content-Encoding', 'gzip');
+    res.setHeader('Vary', 'Accept-Encoding');
+    return res.end(gz);
+  }
+  return res.end(json);
+}
+
+// In local mode the underlying files never change while the process is up, so
+// the whole snapshot (aggregated fact_main + dimensions + gzip bytes) is built
+// once and reused. This turns every page load after the first into an instant
+// buffer write instead of re-reading/re-aggregating ~482 MB of JSON.
+let localSnapshotJsonCache = null;
+
+app.get('/api/dashboard_snapshot', async (req, res) => {
+  try {
+    if (LOCAL_DATA_MODE) {
+      if (!localSnapshotJsonCache) {
+        const snapshot = loadLocalDashboardSnapshot(localDataCache);
+        const factMainRows = Array.isArray(snapshot.fact_main) ? snapshot.fact_main : [];
+        const campaignRows = Array.isArray(snapshot.dim_campaign) ? snapshot.dim_campaign : [];
+        const countryRows = Array.isArray(snapshot.dim_country) ? snapshot.dim_country : [];
+        const releaseRows = Array.isArray(snapshot.fact_release) ? snapshot.fact_release : [];
+        const adoptionRows = Array.isArray(snapshot.fact_adoption_rate) ? snapshot.fact_adoption_rate : [];
+        const aiRows = Array.isArray(snapshot.fact_ai_summaries_latest) ? snapshot.fact_ai_summaries_latest : [];
+
+        // fact_main is aggregated to a compact cube; the browser reconstructs
+        // every KPI/series/delta from the pre-summed components (see App.jsx
+        // valueForKpi). release/adoption stay row-level — they're small and
+        // the DLCM views need per-campaign/per-date granularity.
+        const factMainAgg = buildFactMainAggregate(factMainRows, campaignRows, countryRows);
+        const releaseEnriched = enrichFactRows(releaseRows, campaignRows, countryRows);
+        const adoptionEnriched = enrichFactRows(adoptionRows, campaignRows, countryRows);
+        const filterOptions = buildDashboardFilterCatalog(factMainAgg, campaignRows, countryRows);
+
+        const json = JSON.stringify({
+          mode: 'local',
+          fact_main: factMainAgg,
+          fact_main_enriched: factMainAgg,
+          dim_campaign: campaignRows,
+          dim_country: countryRows,
+          fact_release: releaseEnriched,
+          fact_release_enriched: releaseEnriched,
+          fact_adoption_rate: adoptionEnriched,
+          fact_adoption_rate_enriched: adoptionEnriched,
+          fact_ai_summaries_latest: aiRows,
+          filter_options: filterOptions,
+        });
+        localSnapshotJsonCache = { json, gzip: zlib.gzipSync(json) };
+        console.log(`Local snapshot built: fact_main ${factMainRows.length} rows -> ${factMainAgg.length} aggregated cube rows (${(localSnapshotJsonCache.gzip.length / 1e6).toFixed(1)} MB gzipped).`);
+      }
+      return sendJsonMaybeGzip(req, res, localSnapshotJsonCache);
+    }
+
+    const [factMainRows, campaignRows, countryRows, releaseRows, adoptionRows, aiRows] = await Promise.all([
+      queryFactMainCombined(0, true),
+      queryDimCampaignCombined(0),
+      queryDimCountryCombined(0),
+      queryFactReleaseCombined(0),
+      queryFactAdoptionRateCombined(0),
+      queryAiSummariesLatest(0),
+    ]);
+
+    const factMainEnriched = enrichFactRows(factMainRows, campaignRows, countryRows);
+    const releaseEnriched = enrichFactRows(releaseRows, campaignRows, countryRows);
+    const adoptionEnriched = enrichFactRows(adoptionRows, campaignRows, countryRows);
+    const filterOptions = buildDashboardFilterCatalog(factMainRows, campaignRows, countryRows);
+
+    return sendJsonMaybeGzip(req, res, JSON.stringify({
+      mode: 'live',
+      fact_main: factMainEnriched,
+      fact_main_enriched: factMainEnriched,
+      dim_campaign: campaignRows,
+      dim_country: countryRows,
+      fact_release: releaseEnriched,
+      fact_release_enriched: releaseEnriched,
+      fact_adoption_rate: adoptionEnriched,
+      fact_adoption_rate_enriched: adoptionEnriched,
+      fact_ai_summaries_latest: aiRows,
+      filter_options: filterOptions,
+    }));
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: error.message || String(error), stack: error.stack });
+  }
+});
+
 if (LOCAL_DATA_MODE) {
-  console.log(`Local data mode: serving rows from ${LOCAL_DATA_DIR} (no Databricks connection). Run "node scripts/generate-mock-data.mjs" to (re)create dummy CSVs.`);
+  console.log(`Local data mode: serving rows from ${LOCAL_DATA_DIR} (no Databricks connection). JSON snapshots are preferred; CSV files are still supported.`);
+  generateLocalJsonFilesFromCsvs();
   app.use('/api', (req, res, next) => {
     const name = req.path.replace(/^\/+/, '');
     if (name === 'table_counts') {
       const counts = {};
       const files = fs.existsSync(LOCAL_DATA_DIR) ? fs.readdirSync(LOCAL_DATA_DIR) : [];
       for (const file of files) {
-        if (!file.endsWith('.csv')) continue;
-        const base = file.replace(/\.csv$/, '');
+        if (!file.endsWith('.csv') && !file.endsWith('.json')) continue;
+        const base = file.replace(/\.csv$/, '').replace(/\.json$/, '');
         const rows = loadLocalRows(base) || [];
         counts[base] = [{ table: base, row_count: rows.length }];
       }
@@ -181,15 +243,12 @@ function broadcastWebSocket(payloadObj) {
 
 async function refreshFactMainCache() {
   if (LOCAL_DATA_MODE) {
-    // Seed the cache once from the local CSV so the SSE/WebSocket snapshot
-    // path works without Databricks; no periodic refresh needed.
-    if (cache.fact_main.rows && cache.fact_main.rows.length) return;
-    const rows = loadLocalRows('fact_main') || [];
-    cache.fact_main.rows = rows;
-    cache.fact_main.updatedAt = Date.now();
-    const payload = { full: true, rows, updatedAt: cache.fact_main.updatedAt };
-    broadcastFactMainUpdate(payload);
-    broadcastWebSocket(payload);
+    // Local files are static for the life of the process and the browser
+    // already receives the aggregated fact_main via /api/dashboard_snapshot.
+    // Broadcasting the full ~1M raw rows over WebSocket here would (a) load
+    // and hold the entire raw table in memory a second time and (b) overwrite
+    // the browser's compact aggregate with raw rows the frontend can't
+    // aggregate. So there is nothing to stream in local mode — no-op.
     return;
   }
   try {
@@ -492,27 +551,36 @@ async function queryFactMainEUwithUSCACombined(limit = 100) {
 }
 
 async function queryAiSummariesLatest(limit) {
-  const result = await executeAgainstFirstAvailable(
-    'fact_ai_summaries_facts_v3_int',
-    (fullName) => `SELECT * FROM ${fullName}`
-  );
-  const allRows = (result.rows || []).map(transformRow);
-  if (allRows.length === 0) return [];
+  try {
+    const result = await executeAgainstFirstAvailable(
+      'fact_ai_summaries_facts_v3_int',
+      (fullName) => `SELECT * FROM ${fullName}`
+    );
+    const allRows = (result.rows || []).map(transformRow);
+    if (allRows.length === 0) {
+      const fallbackRows = loadLocalRows('fact_ai_summaries_latest') || [];
+      return limit ? fallbackRows.slice(0, limit) : fallbackRows;
+    }
 
-  // See scripts/export-combined-csv.js queryAiSummariesLatest for why this
-  // filters in JS instead of `WHERE generated_at = (SELECT MAX(...))`: NULL
-  // generated_at values make that SQL equality match nothing, and per-row
-  // (rather than per-batch) timestamps can make MAX() match only one row.
-  const validDates = allRows
-    .map((row) => row.generated_at)
-    .filter((v) => v !== null && v !== undefined && String(v).trim() !== '');
-  if (validDates.length === 0) {
-    console.warn('fact_ai_summaries_facts_v3_int: generated_at is empty on every row; returning all rows unfiltered.');
-    return limit ? allRows.slice(0, limit) : allRows;
+    // See scripts/export-combined-csv.js queryAiSummariesLatest for why this
+    // filters in JS instead of `WHERE generated_at = (SELECT MAX(...))`: NULL
+    // generated_at values make that SQL equality match nothing, and per-row
+    // (rather than per-batch) timestamps can make MAX() match only one row.
+    const validDates = allRows
+      .map((row) => row.generated_at)
+      .filter((v) => v !== null && v !== undefined && String(v).trim() !== '');
+    if (validDates.length === 0) {
+      console.warn('fact_ai_summaries_facts_v3_int: generated_at is empty on every row; returning all rows unfiltered.');
+      return limit ? allRows.slice(0, limit) : allRows;
+    }
+    const maxDate = validDates.reduce((max, v) => (String(v) > String(max) ? v : max));
+    const latestRows = allRows.filter((row) => row.generated_at === maxDate);
+    return limit ? latestRows.slice(0, limit) : latestRows;
+  } catch (error) {
+    console.warn('fact_ai_summaries_facts_v3_int: live query failed, falling back to local CSV', error && error.message ? error.message : String(error));
+    const fallbackRows = loadLocalRows('fact_ai_summaries_latest') || [];
+    return limit ? fallbackRows.slice(0, limit) : fallbackRows;
   }
-  const maxDate = validDates.reduce((max, v) => (String(v) > String(max) ? v : max));
-  const latestRows = allRows.filter((row) => row.generated_at === maxDate);
-  return limit ? latestRows.slice(0, limit) : latestRows;
 }
 
 async function countTables(tableNames) {
@@ -532,17 +600,13 @@ async function countTables(tableNames) {
 app.get("/api/fact_main_oru4_prod", async (req, res) => {
   try {
     // Prefer serving from cache for fast responses; fall back to a live
-    // query if cache is empty. Unlimited by default (0) — pass ?limit= to
-    // cap explicitly.
+    // query if cache is empty. By default return the full table; pass
+    // ?limit=200 to cap explicitly.
     const limit = Number(req.query.limit) || 0;
     if (cache.fact_main && cache.fact_main.rows && cache.fact_main.rows.length) {
       return res.json(limit > 0 ? cache.fact_main.rows.slice(0, limit) : cache.fact_main.rows);
     }
-    // Cache is still warming up: return a small sample quickly rather than
-    // block on a full unlimited query, unless the caller explicitly asked
-    // for a smaller/larger cap via ?limit=.
-    const sampleLimit = limit > 0 ? Math.min(200, limit) : 200;
-    const rows = await queryFactMainCombined(sampleLimit, true);
+    const rows = await queryFactMainCombined(limit, true);
     return res.json(rows);
   } catch (error) {
     console.error(error);
@@ -699,6 +763,118 @@ function enrichFactRows(rows, campaignRows, countryRows) {
     }
     return enriched;
   });
+}
+
+// Collapse the ~1M-row fact_main table into a compact cube keyed by
+// date × region × country × brand × platform × recall, carrying the
+// pre-summed components every KPI is built from. Every dashboard KPI is a
+// sum or a ratio-of-sums, so the browser can reconstruct exact whole-dataset
+// values, per-day series and windowed deltas from this cube without ever
+// receiving the raw rows — turning a ~482 MB transfer into a few MB. Runs in
+// a single pass (enrich inline) so we never materialize 1M enriched objects.
+function toNum(value) {
+  if (value === undefined || value === null || value === '') return 0;
+  const n = Number(value);
+  return Number.isNaN(n) ? 0 : n;
+}
+
+function normalizeAggDate(raw) {
+  if (!raw) return '';
+  // Local CSV timestamps arrive double-quoted (value is literally
+  // `"2021-03-04T00:00:00.000Z"` including the quote chars), so strip
+  // surrounding quotes/whitespace before parsing or Date fails and we'd bucket
+  // by a garbage substring.
+  const s = normalizeTimestampString(String(raw).trim().replace(/^"+|"+$/g, ''));
+  const d = new Date(s);
+  if (Number.isNaN(d.valueOf())) return s.slice(0, 10);
+  return d.toISOString().slice(0, 10);
+}
+
+function buildFactMainAggregate(factRows, campaignRows, countryRows) {
+  const campaignLookup = buildFactCampaignLookup(campaignRows);
+  const countryLookup = buildFactCountryLookup(countryRows);
+  const groups = new Map();
+
+  for (const row of factRows) {
+    const campaignKey = normalizeFactCampaignKey(row);
+    const dimCampaign = campaignLookup.get(campaignKey) || {};
+    const countryIso = row.country_iso ?? row.country ?? row.iso;
+    const dimCountry = (countryIso ? countryLookup.get(countryIso) : undefined) || {};
+
+    const brand = row.brand || dimCampaign.brand || '';
+    const platform = row.platform || dimCampaign.platform || '';
+    const recall = row.recall || dimCampaign.recall || campaignKey || '';
+    const country_name = row.country_name || dimCountry.country_name || row.country || '';
+    const region = row.region || dimCountry.region || row.region_name || '';
+    const date = normalizeAggDate(row.date ?? row.Date);
+
+    const key = `${date} ${region} ${country_name} ${brand} ${platform} ${recall}`;
+    let g = groups.get(key);
+    if (!g) {
+      g = {
+        date, region, country_name, brand, platform, recall,
+        _agg: 1, _n: 0,
+        successful_updates: 0,
+        _quality_weight: 0,
+        _quality_sum: 0,
+        downtime_minutes: 0,
+        customerWarning_minor: 0,
+        customerWarning_major: 0,
+        update_operations: 0,
+        lb_common_vehicles: 0,
+        lb_backend_vehicles: 0,
+        lb_aftersales_vehicles: 0,
+        cost_savings: 0,
+        co2_savings: 0,
+      };
+      groups.set(key, g);
+    }
+    const updates = toNum(row.successful_updates);
+    const quality = toNum(row.quality);
+    g._n += 1;
+    g.successful_updates += updates;
+    g._quality_weight += quality * updates;
+    g._quality_sum += quality;
+    g.downtime_minutes += toNum(row.downtime_minutes);
+    g.customerWarning_minor += toNum(row.customerWarning_minor);
+    g.customerWarning_major += toNum(row.customerWarning_major);
+    g.update_operations += toNum(row.update_operations);
+    g.lb_common_vehicles += toNum(row.lb_common_vehicles);
+    g.lb_backend_vehicles += toNum(row.lb_backend_vehicles);
+    g.lb_aftersales_vehicles += toNum(row.lb_aftersales_vehicles);
+    g.cost_savings += toNum(row.cost_savings);
+    g.co2_savings += toNum(row.co2_savings);
+  }
+
+  return Array.from(groups.values());
+}
+
+function buildDashboardFilterCatalog(factRows, campaignRows, countryRows) {
+  const enriched = enrichFactRows(factRows, campaignRows, countryRows);
+  const brandOptions = [...new Set(enriched.map((row) => row.brand).filter(Boolean))].sort();
+  const platformOptions = [...new Set(enriched.map((row) => row.platform).filter(Boolean))].sort();
+  const recallOptions = [...new Set(enriched.map((row) => row.recall).filter(Boolean))].sort();
+  const regionOptions = [...new Set(enriched.map((row) => row.region || row.region_name).filter(Boolean))].sort();
+  const countryOptions = [...new Set(enriched.map((row) => row.country_name || row.country).filter(Boolean))].sort();
+
+  const regionCountryMap = new Map();
+  for (const row of countryRows || []) {
+    const region = row.region_name ?? row.region ?? '';
+    const country = row.country_name ?? row.country ?? row.country_iso ?? '';
+    if (!region || !country) continue;
+    if (!regionCountryMap.has(region)) regionCountryMap.set(region, []);
+    regionCountryMap.get(region).push(country);
+  }
+  for (const countries of regionCountryMap.values()) countries.sort();
+
+  return {
+    brands: brandOptions,
+    platforms: platformOptions,
+    recalls: recallOptions,
+    regions: regionOptions,
+    countries: countryOptions,
+    regionCountryMap: Object.fromEntries([...regionCountryMap.entries()]),
+  };
 }
 
 app.get("/api/fact_targeted_vehicles_combined", async (req, res) => {
