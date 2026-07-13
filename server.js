@@ -88,19 +88,75 @@ app.get('/api/status', (req, res) => {
 // aggregated facts), highly repetitive JSON, so gzip typically shrinks it ~10x
 // — the single biggest lever on perceived load time in local mode.
 function sendJsonMaybeGzip(req, res, payload) {
-  // `payload` may be a raw JSON string or a { json, gzip } pair carrying a
+  // `payload` may be a raw JSON string or a { gzip } pair carrying a
   // pre-computed gzip buffer (used for the cached local snapshot so we never
   // re-compress ~300 MB per request).
-  const json = typeof payload === 'string' ? payload : payload.json;
   const accepts = String(req.headers['accept-encoding'] || '').includes('gzip');
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  if (typeof payload === 'string') {
+    if (accepts) {
+      res.setHeader('Content-Encoding', 'gzip');
+      res.setHeader('Vary', 'Accept-Encoding');
+      return res.end(zlib.gzipSync(payload));
+    }
+    return res.end(payload);
+  }
   if (accepts) {
-    const gz = typeof payload === 'string' ? zlib.gzipSync(json) : payload.gzip;
     res.setHeader('Content-Encoding', 'gzip');
     res.setHeader('Vary', 'Accept-Encoding');
-    return res.end(gz);
+    return res.end(payload.gzip);
   }
-  return res.end(json);
+  // Client doesn't accept gzip: only real-world case is non-browser tooling.
+  // Rebuilding the multi-hundred-MB plain string here can hit the same V8
+  // string-length ceiling the buffer-based build was written to avoid, so
+  // this is a deliberate, clearly-labeled failure rather than a crash.
+  res.status(415);
+  return res.end(JSON.stringify({ error: 'Response only available gzip-encoded for datasets this large; request with Accept-Encoding: gzip.' }));
+}
+
+// V8 caps a single JS string well under ~1 GB, but Buffer.concat has no such
+// ceiling — so a JSON array is built as a sequence of small stringified
+// batches, each converted to a Buffer immediately, instead of ever forming
+// one giant string. This is what buildLocalSnapshot's plain JSON.stringify
+// used to do, and why it could throw "RangeError: Invalid string length"
+// once the real (non-mock) dataset grew large enough.
+const JSON_ARRAY_BATCH_SIZE = 2000;
+function jsonArrayBuffer(rows) {
+  const parts = [Buffer.from('[', 'utf8')];
+  for (let i = 0; i < rows.length; i += JSON_ARRAY_BATCH_SIZE) {
+    const batch = rows.slice(i, i + JSON_ARRAY_BATCH_SIZE);
+    const inner = JSON.stringify(batch).slice(1, -1); // strip batch's own [ ]
+    if (!inner) continue;
+    if (parts.length > 1) parts.push(Buffer.from(',', 'utf8'));
+    parts.push(Buffer.from(inner, 'utf8'));
+  }
+  parts.push(Buffer.from(']', 'utf8'));
+  return Buffer.concat(parts);
+}
+
+// Builds the full dashboard snapshot response as a Buffer (never a single JS
+// string) by concatenating each field's Buffer. fact_main/_enriched and the
+// *_enriched release/adoption fields are byte-identical to their non-
+// enriched counterparts, so the same Buffer is reused rather than built
+// twice.
+function buildSnapshotBuffer({ mode, factMainAgg, campaignRows, countryRows, releaseEnriched, adoptionEnriched, aiRows, filterOptions }) {
+  const factMainBuf = jsonArrayBuffer(factMainAgg);
+  const releaseBuf = jsonArrayBuffer(releaseEnriched);
+  const adoptionBuf = jsonArrayBuffer(adoptionEnriched);
+  return Buffer.concat([
+    Buffer.from(`{"mode":${JSON.stringify(mode)}`, 'utf8'),
+    Buffer.from(',"fact_main":', 'utf8'), factMainBuf,
+    Buffer.from(',"fact_main_enriched":', 'utf8'), factMainBuf,
+    Buffer.from(',"dim_campaign":', 'utf8'), jsonArrayBuffer(campaignRows),
+    Buffer.from(',"dim_country":', 'utf8'), jsonArrayBuffer(countryRows),
+    Buffer.from(',"fact_release":', 'utf8'), releaseBuf,
+    Buffer.from(',"fact_release_enriched":', 'utf8'), releaseBuf,
+    Buffer.from(',"fact_adoption_rate":', 'utf8'), adoptionBuf,
+    Buffer.from(',"fact_adoption_rate_enriched":', 'utf8'), adoptionBuf,
+    Buffer.from(',"fact_ai_summaries_latest":', 'utf8'), Buffer.from(JSON.stringify(aiRows), 'utf8'),
+    Buffer.from(',"filter_options":', 'utf8'), Buffer.from(JSON.stringify(filterOptions), 'utf8'),
+    Buffer.from('}', 'utf8'),
+  ]);
 }
 
 // In local mode the underlying files never change while the process is up, so
@@ -130,20 +186,11 @@ function buildLocalSnapshot() {
   const adoptionEnriched = enrichFactRows(adoptionRows, campaignRows, countryRows);
   const filterOptions = buildDashboardFilterCatalog(factMainAgg, campaignRows, countryRows);
 
-  const json = JSON.stringify({
-    mode: 'local',
-    fact_main: factMainAgg,
-    fact_main_enriched: factMainAgg,
-    dim_campaign: campaignRows,
-    dim_country: countryRows,
-    fact_release: releaseEnriched,
-    fact_release_enriched: releaseEnriched,
-    fact_adoption_rate: adoptionEnriched,
-    fact_adoption_rate_enriched: adoptionEnriched,
-    fact_ai_summaries_latest: aiRows,
-    filter_options: filterOptions,
+  const buf = buildSnapshotBuffer({
+    mode: 'local', factMainAgg, campaignRows, countryRows,
+    releaseEnriched, adoptionEnriched, aiRows, filterOptions,
   });
-  localSnapshotJsonCache = { json, gzip: zlib.gzipSync(json) };
+  localSnapshotJsonCache = { gzip: zlib.gzipSync(buf) };
   console.log(`Local snapshot built: fact_main ${factMainRows.length} rows -> ${factMainAgg.length} aggregated cube rows (${(localSnapshotJsonCache.gzip.length / 1e6).toFixed(1)} MB gzipped).`);
   return localSnapshotJsonCache;
 }
@@ -169,19 +216,11 @@ app.get('/api/dashboard_snapshot', async (req, res) => {
     const adoptionEnriched = enrichFactRows(adoptionRows, campaignRows, countryRows);
     const filterOptions = buildDashboardFilterCatalog(factMainRows, campaignRows, countryRows);
 
-    return sendJsonMaybeGzip(req, res, JSON.stringify({
-      mode: 'live',
-      fact_main: factMainEnriched,
-      fact_main_enriched: factMainEnriched,
-      dim_campaign: campaignRows,
-      dim_country: countryRows,
-      fact_release: releaseEnriched,
-      fact_release_enriched: releaseEnriched,
-      fact_adoption_rate: adoptionEnriched,
-      fact_adoption_rate_enriched: adoptionEnriched,
-      fact_ai_summaries_latest: aiRows,
-      filter_options: filterOptions,
-    }));
+    const buf = buildSnapshotBuffer({
+      mode: 'live', factMainAgg: factMainEnriched, campaignRows, countryRows,
+      releaseEnriched, adoptionEnriched, aiRows, filterOptions,
+    });
+    return sendJsonMaybeGzip(req, res, { gzip: zlib.gzipSync(buf) });
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: error.message || String(error), stack: error.stack });
