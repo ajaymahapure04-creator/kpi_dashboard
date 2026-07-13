@@ -91,12 +91,6 @@ const BRANDS = ["VW", "Audi", "Porsche", "Škoda", "CUPRA", "MAN"];
 const REGIONS = ["Europe", "North America", "China", "South America", "RoW"];
 const PLATFORMS = ["MQB", "MLB", "MEB", "PPE"];
 
-// Fleet shares used to scale volume KPIs when a scope filter is applied
-const BRAND_SHARE = { VW: 0.34, Audi: 0.22, Porsche: 0.07, "Škoda": 0.17, CUPRA: 0.09, MAN: 0.11 };
-const REGION_SHARE = { Europe: 0.48, "North America": 0.17, China: 0.24, "South America": 0.06, RoW: 0.05 };
-const PLATFORM_SHARE = { MQB: 0.38, MLB: 0.22, MEB: 0.28, PPE: 0.12 };
-const RECALL_SHARE = { "R-2214": 0.04, "R-2260": 0.03, "R-2301": 0.02 };
-
 // Empty array = "All" (no constraint on that dimension)
 const DEFAULT_FILTERS = {
   region: [], country: [], brand: [], platform: [], recall: [],
@@ -269,11 +263,9 @@ function cascadeFilters(filters, available) {
   return out;
 }
 
-// Derive a deterministic scope from the filters: volume scale factor,
-// a seed shift so every scope draws a different (but stable) series,
-// and the list of active selections for display.
-const sumShare = (sel, table) => (sel.length ? Math.min(1, sel.reduce((a, k) => a + (table[k] ?? 0.08), 0)) : 1);
-
+// Derive a deterministic scope from the filters: a seed shift so every
+// scope draws a different (but stable) series, and the list of active
+// selections for display.
 function filterScope(filters) {
   const active = [
     ...filters.brand,
@@ -282,30 +274,8 @@ function filterScope(filters) {
     ...filters.platform,
     ...filters.recall,
   ];
-  const scale =
-    sumShare(filters.brand, BRAND_SHARE) *
-    sumShare(filters.region, REGION_SHARE) *
-    sumShare(filters.country, {}) *
-    sumShare(filters.platform, PLATFORM_SHARE) *
-    sumShare(filters.recall, RECALL_SHARE);
   const seedShift = active.join("").split("").reduce((a, c) => a + c.charCodeAt(0), 0) % 89 * 0.37;
-  return { scale, seedShift, active };
-}
-
-// Rescale a display magnitude like "17.7M", "+29.1K" or "2.0bn" by a factor,
-// re-picking the suffix so filtered values stay readable.
-function scaleMagnitude(str, scale) {
-  if (scale === 1) return str;
-  const m = String(str).match(/^([+-]?)(\d+(?:\.\d+)?)(bn|M|K)?$/);
-  if (!m) return str;
-  const mult = { bn: 1e9, M: 1e6, K: 1e3 }[m[3]] ?? 1;
-  const abs = parseFloat(m[2]) * mult * scale;
-  let out;
-  if (abs >= 1e9) out = (abs / 1e9).toFixed(1) + "bn";
-  else if (abs >= 1e6) out = (abs / 1e6).toFixed(1) + "M";
-  else if (abs >= 1e3) out = (abs / 1e3).toFixed(1) + "K";
-  else out = abs.toFixed(abs < 10 ? 1 : 0);
-  return m[1] + out;
+  return { seedShift, active };
 }
 
 /* ------------------------------------------------------------------ */
@@ -386,7 +356,6 @@ const KPIS = [
     value: "17.7M",
     d7: "+29.1K", d30: "+179.6K",
     goodWhen: "up",
-    scaleWithFleet: true,
     icon: CloudUpload,
     insight:
       "MAN shatters its monthly update record: +415% above average, +37% above prior all-time high.",
@@ -471,7 +440,6 @@ const KPIS = [
     value: "2.0bn",
     d7: "+3.9M", d30: "+25.5M",
     goodWhen: "up",
-    scaleWithFleet: true,
     icon: Euro,
     seed: 61, base: 1.1, vol: 0.15, drift: 0.03,
     detailNote: "Cumulative avoided workshop, recall and logistics cost (€, daily increment in M)",
@@ -487,7 +455,6 @@ const KPIS = [
     value: "66.5M",
     d7: "+83", d30: "+523",
     goodWhen: "up",
-    scaleWithFleet: true,
     icon: Leaf,
     seed: 71, base: 18, vol: 2.2, drift: 0.15,
     detailNote: "Avoided emissions from workshop trips (daily increment, tonnes)",
@@ -547,14 +514,15 @@ const deltaColor = (raw, goodWhen) => {
   return good ? C.good : C.bad;
 };
 
-// Project a KPI into the current filter scope (volume KPIs scale with fleet share)
-function scopedKpi(kpi, scope) {
-  if (!kpi.scaleWithFleet || scope.scale === 1) return kpi;
+// No usable backend data for this KPI — show a real zero instead of a
+// plausible-looking sample number, so an empty/broken data source never
+// reads as an actual result.
+function zeroedKpi(kpi) {
   return {
     ...kpi,
-    value: scaleMagnitude(kpi.value, scope.scale),
-    d7: scaleMagnitude(kpi.d7, scope.scale),
-    d30: scaleMagnitude(kpi.d30, scope.scale),
+    value: formatKpiValue(0, kpi.id),
+    d7: formatKpiDelta(0, kpi.id),
+    d30: formatKpiDelta(0, kpi.id),
   };
 }
 
@@ -720,13 +688,12 @@ function deltaForKpi(rows, kpiId, days) {
   return a - b;
 }
 
-function runtimeKpi(kpi, rows, scope) {
+function runtimeKpi(kpi, rows) {
   const actualValue = valueForKpi(rows, kpi.id);
-  // No usable backend data: fall back to the static registry values, scaled
-  // by the fleet-share approximation.
-  if (actualValue == null) return scopedKpi(kpi, scope);
-  // Live values are computed from already-filtered rows — applying the
-  // fleet-share scaling on top would double-count the filter.
+  // No usable backend data: show zero rather than the static registry
+  // sample values — a plausible-looking number with no real data behind it
+  // would mislead whoever's reading the dashboard.
+  if (actualValue == null) return zeroedKpi(kpi);
   const d7 = formatKpiDelta(deltaForKpi(rows, kpi.id, 7), kpi.id);
   const d30 = formatKpiDelta(deltaForKpi(rows, kpi.id, 30), kpi.id);
   return {
@@ -1248,9 +1215,6 @@ function FilterBar({ filters, setFilters, regionCountryMap, brandOptions, platfo
               {a}
             </span>
           ))}
-          <span className="text-xs" style={{ color: C.faint }}>
-            (~{(scope.scale * 100).toFixed(scope.scale < 0.1 ? 1 : 0)}% of fleet — volume KPIs rescaled)
-          </span>
         </div>
       )}
     </div>
@@ -1377,7 +1341,6 @@ function DlcmLink({ icon: Icon, l1, l2, disabled, onClick }) {
 }
 
 function Overview({ onOpen, onDlcm, filters, filteredRows, aiSummaries }) {
-  const scope = filterScope(filters);
   // Each primary card's insight is the top-ranked AI summary compatible with
   // this KPI and the active region/brand/platform filters. No match (e.g. a
   // filter combination the AI summaries don't cover) means no insight —
@@ -1386,8 +1349,8 @@ function Overview({ onOpen, onDlcm, filters, filteredRows, aiSummaries }) {
     const s = summariesMatchingScope(aiSummaries, k.id, filters)[0];
     return { ...k, insight: s ? (s.headline || s.fact) : "", insightMeta: s ? formatInsightMeta(s) : "" };
   };
-  const primaries = KPIS.filter((k) => k.tier === "primary").map((k) => withLiveInsight(runtimeKpi(k, filteredRows, scope)));
-  const secondaries = KPIS.filter((k) => k.tier === "secondary").map((k) => runtimeKpi(k, filteredRows, scope));
+  const primaries = KPIS.filter((k) => k.tier === "primary").map((k) => withLiveInsight(runtimeKpi(k, filteredRows)));
+  const secondaries = KPIS.filter((k) => k.tier === "secondary").map((k) => runtimeKpi(k, filteredRows));
   return (
     <div className="px-4 py-1.5 flex flex-col gap-1.5" style={{ minHeight: "100%" }}>
       <section className="flex-[4] min-h-0 flex flex-col">
@@ -1455,7 +1418,7 @@ function NoData({ label = "No data for the current filter selection" }) {
 
 function Detail({ kpiId, onBack, filters, filteredRows, aiSummaries }) {
   const scope = filterScope(filters);
-  const kpi = runtimeKpi(KPIS.find((k) => k.id === kpiId), filteredRows, scope);
+  const kpi = runtimeKpi(KPIS.find((k) => k.id === kpiId), filteredRows);
   const [range, setRange] = useState(30);
   // Charts render backend rows only — an empty result shows an empty state,
   // never a synthetic series.
