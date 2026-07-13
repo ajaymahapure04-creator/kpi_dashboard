@@ -193,11 +193,19 @@ if (LOCAL_DATA_MODE) {
   generateLocalJsonFilesFromCsvs();
   // Pre-warm the aggregated snapshot now, before the port opens, so the
   // one-time aggregation cost lands at boot instead of stalling the first
-  // browser to load the dashboard.
+  // browser to load the dashboard. Failures here must not crash the
+  // server — fall back to the old lazy build-on-first-request behavior
+  // (still inside the /api/dashboard_snapshot try/catch) so a bad local
+  // data file degrades to a 500 on that one route instead of taking the
+  // whole backend down.
   console.log('Pre-warming local dashboard snapshot (this can take a while for large datasets)...');
   const warmupStartedAt = Date.now();
-  buildLocalSnapshot();
-  console.log(`Snapshot pre-warm finished in ${((Date.now() - warmupStartedAt) / 1000).toFixed(1)}s.`);
+  try {
+    buildLocalSnapshot();
+    console.log(`Snapshot pre-warm finished in ${((Date.now() - warmupStartedAt) / 1000).toFixed(1)}s.`);
+  } catch (error) {
+    console.error('Snapshot pre-warm failed, will retry lazily on first request:', error);
+  }
   app.use('/api', (req, res, next) => {
     const name = req.path.replace(/^\/+/, '');
     if (name === 'table_counts') {
