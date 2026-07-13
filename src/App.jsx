@@ -676,7 +676,12 @@ function deltaForKpi(rows, kpiId, days) {
     if (parsed) dated.push({ row, time: parsed.valueOf() });
   }
   if (!dated.length) return null;
-  const end = Math.max(...dated.map((d) => d.time));
+  // Not Math.max(...dated.map(...)) — spreading one argument per array
+  // element blows V8's call-stack argument limit once rows are in the
+  // hundreds of thousands (real dataset scale), throwing "Maximum call
+  // stack size exceeded" and crashing the whole render.
+  let end = -Infinity;
+  for (const d of dated) if (d.time > end) end = d.time;
   const currStart = end - days * DAY;
   const prevStart = end - 2 * days * DAY;
   const curr = dated.filter((d) => d.time > currStart).map((d) => d.row);
