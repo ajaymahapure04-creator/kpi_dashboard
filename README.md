@@ -11,7 +11,6 @@ Databricks SQL, caches results, and streams updates to the browser.
 - `.env` — local environment loading for Databricks hosts, tokens, port, and schema settings
 - `vite.config.js` — frontend proxy of `/api` to the backend
 - `scripts/start-dev.js` — combined `npm run dev-all` startup for backend + frontend
-- `cariad-ota-dashboard.jsx` — legacy reference component kept for comparison
 
 ## Local development
 
