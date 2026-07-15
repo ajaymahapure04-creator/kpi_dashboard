@@ -929,8 +929,9 @@ function DateRangeSlider({ from, to, onChange }) {
   );
 }
 
-/* Multi-select dropdown with checkboxes. `options` is [{ v, enabled }];
-   disabled entries are values cascaded away by the other filters. */
+/* Multi-select dropdown with checkboxes. `options` is a plain list of
+   values already cascaded down to what's relevant given the other active
+   filters — values cascaded away by other filters simply aren't listed. */
 function MultiSelect({ label, values, options, onChange }) {
   const [open, setOpen] = useState(false);
   const ref = useRef(null);
@@ -972,20 +973,14 @@ function MultiSelect({ label, values, options, onChange }) {
           >
             All ({label})
           </button>
-          {options.map(({ v, enabled }) => (
-            <label
-              key={v}
-              className="flex items-center gap-2 px-2 py-1 text-sm"
-              style={{
-                color: enabled ? C.text : C.disabledText,
-                opacity: enabled ? 1 : 0.55,
-                cursor: enabled ? "pointer" : "not-allowed",
-              }}
-            >
+          {options.length === 0 && (
+            <div className="px-2 py-1 text-xs" style={{ color: C.faint }}>No matching options</div>
+          )}
+          {options.map((v) => (
+            <label key={v} className="flex items-center gap-2 px-2 py-1 text-sm" style={{ color: C.text, cursor: "pointer" }}>
               <input
                 type="checkbox"
                 checked={values.includes(v)}
-                disabled={!enabled}
                 onChange={() => toggle(v)}
                 style={{ accentColor: C.accent }}
               />
@@ -1023,7 +1018,7 @@ function RegionCountryFilter({ label, regionValues, countryValues, regionCountry
     return next;
   });
 
-  const regions = [...regionCountryMap.keys()].sort();
+  const regions = [...regionCountryMap.keys()].filter((r) => regionAvailable.has(r)).sort();
   const summaryParts = [];
   if (regionValues.length) summaryParts.push(regionValues.length <= 2 ? regionValues.join(", ") : `${regionValues.length} regions`);
   if (countryValues.length) summaryParts.push(countryValues.length <= 2 ? countryValues.join(", ") : `${countryValues.length} countries`);
@@ -1054,9 +1049,11 @@ function RegionCountryFilter({ label, regionValues, countryValues, regionCountry
           >
             All ({label})
           </button>
+          {regions.length === 0 && (
+            <div className="px-2 py-1 text-xs" style={{ color: C.faint }}>No matching options</div>
+          )}
           {regions.map((region) => {
-            const countries = regionCountryMap.get(region) || [];
-            const regionEnabled = regionAvailable.has(region);
+            const countries = (regionCountryMap.get(region) || []).filter((c) => countryAvailable.has(c));
             const isExpanded = expanded.has(region);
             return (
               <div key={region}>
@@ -1071,18 +1068,10 @@ function RegionCountryFilter({ label, regionValues, countryValues, regionCountry
                   >
                     <ChevronRight size={12} style={{ transform: `rotate(${isExpanded ? 90 : 0}deg)`, transition: "transform 0.15s" }} />
                   </button>
-                  <label
-                    className="flex items-center gap-2 px-1 py-0.5 text-sm flex-1 min-w-0"
-                    style={{
-                      color: regionEnabled ? C.text : C.disabledText,
-                      opacity: regionEnabled ? 1 : 0.55,
-                      cursor: regionEnabled ? "pointer" : "not-allowed",
-                    }}
-                  >
+                  <label className="flex items-center gap-2 px-1 py-0.5 text-sm flex-1 min-w-0" style={{ color: C.text, cursor: "pointer" }}>
                     <input
                       type="checkbox"
                       checked={regionValues.includes(region)}
-                      disabled={!regionEnabled}
                       onChange={() => toggleRegion(region)}
                       style={{ accentColor: C.accent }}
                     />
@@ -1091,29 +1080,17 @@ function RegionCountryFilter({ label, regionValues, countryValues, regionCountry
                 </div>
                 {isExpanded && (
                   <div className="flex flex-col" style={{ marginLeft: 26 }}>
-                    {countries.map((country) => {
-                      const countryEnabled = countryAvailable.has(country);
-                      return (
-                        <label
-                          key={country}
-                          className="flex items-center gap-2 px-2 py-0.5 text-sm"
-                          style={{
-                            color: countryEnabled ? C.text : C.disabledText,
-                            opacity: countryEnabled ? 1 : 0.55,
-                            cursor: countryEnabled ? "pointer" : "not-allowed",
-                          }}
-                        >
-                          <input
-                            type="checkbox"
-                            checked={countryValues.includes(country)}
-                            disabled={!countryEnabled}
-                            onChange={() => toggleCountry(country)}
-                            style={{ accentColor: C.accent }}
-                          />
-                          <span className="truncate">{country}</span>
-                        </label>
-                      );
-                    })}
+                    {countries.map((country) => (
+                      <label key={country} className="flex items-center gap-2 px-2 py-0.5 text-sm" style={{ color: C.text, cursor: "pointer" }}>
+                        <input
+                          type="checkbox"
+                          checked={countryValues.includes(country)}
+                          onChange={() => toggleCountry(country)}
+                          style={{ accentColor: C.accent }}
+                        />
+                        <span className="truncate">{country}</span>
+                      </label>
+                    ))}
                   </div>
                 )}
               </div>
@@ -1143,7 +1120,16 @@ function Select({ label, value, options, onChange }) {
 }
 
 function FilterBar({ filters, setFilters, regionCountryMap, brandOptions, platformOptions, recallOptions, enrichedRows, filterCatalog }) {
+  // Cascading availability must be recomputed from the actual rows on every
+  // filter change — the server's filterCatalog is a single whole-dataset
+  // snapshot fetched once, so using it directly here made every dimension
+  // always show its full, un-narrowed option list regardless of what else
+  // was selected. Only fall back to it before any rows have loaded yet, so
+  // the dropdowns aren't empty during the initial fetch.
   const available = useMemo(() => {
+    if (enrichedRows && enrichedRows.length) {
+      return getAvailableDimensionOptions(filters, enrichedRows);
+    }
     if (filterCatalog) {
       return {
         region: new Set(filterCatalog.regions || []),
@@ -1164,7 +1150,7 @@ function FilterBar({ filters, setFilters, regionCountryMap, brandOptions, platfo
   });
   const reset = () => setFilters(DEFAULT_FILTERS);
   const scope = filterScope(filters);
-  const optsFor = (dim, all) => all.map((v) => ({ v, enabled: available[dim].has(v) }));
+  const optsFor = (dim, all) => all.filter((v) => available[dim].has(v));
   return (
     <div
       className="flex flex-wrap items-end gap-3 px-4 py-2 shrink-0"
