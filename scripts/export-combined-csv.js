@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import dotenv from 'dotenv';
 import { DBSQLClient } from '@databricks/sql';
+import { generateLocalJsonFilesFromCsvs } from './local-data-utils.mjs';
 
 dotenv.config();
 
@@ -588,6 +589,17 @@ async function exportAllCsv() {
     } catch (error) {
       console.error(`Failed to export ${item.name}:`, error && error.message ? error.message : error);
     }
+  }
+
+  // Local-data mode prefers JSON over CSV (faster to parse, no quoting/type
+  // ambiguity) and server.js would otherwise only generate it lazily on next
+  // boot. Regenerate it here too so `data/*.json` is fresh immediately after
+  // export, not stale from before this run.
+  try {
+    const generated = generateLocalJsonFilesFromCsvs();
+    console.log(`Generated JSON snapshots for: ${generated.join(', ') || '(none)'}`);
+  } catch (error) {
+    console.error('Failed to generate local JSON files from CSVs:', error && error.message ? error.message : error);
   }
 }
 
