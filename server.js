@@ -860,7 +860,11 @@ function buildFactCountryLookup(rows) {
     lookup.set(iso, {
       country_name: row.country_name ?? row.country ?? undefined,
       region_name: row.region_name ?? row.region ?? undefined,
-      region: row.region ?? row.region_name ?? undefined,
+      // region_name (display, e.g. "Europe") must win over region/Source
+      // (technical merge-lineage tag, e.g. "EU"/"USCA"/"NAR-CN") — those are
+      // deliberately different values in this data model, and the filter
+      // catalog's regionCountryMap already prioritizes region_name this way.
+      region: row.region_name ?? row.region ?? undefined,
     });
   }
   return lookup;
@@ -884,7 +888,11 @@ function enrichFactRows(rows, campaignRows, countryRows) {
     if (dimCountry) {
       if (!enriched.country_name && dimCountry.country_name) enriched.country_name = dimCountry.country_name;
       if (!enriched.region_name && dimCountry.region_name) enriched.region_name = dimCountry.region_name;
-      if (!enriched.region && dimCountry.region) enriched.region = dimCountry.region;
+      // Always prefer dim_country's resolved region (display name) over
+      // whatever the fact row itself might already carry as `region` — that
+      // field is often the technical Source/merge-lineage tag, not the
+      // display region, and would otherwise silently win here.
+      if (dimCountry.region) enriched.region = dimCountry.region;
     }
     return enriched;
   });
@@ -930,7 +938,12 @@ function buildFactMainAggregate(factRows, campaignRows, countryRows) {
     const platform = row.platform || dimCampaign.platform || '';
     const recall = row.recall || dimCampaign.recall || campaignKey || '';
     const country_name = row.country_name || dimCountry.country_name || row.country || '';
-    const region = row.region || dimCountry.region || row.region_name || '';
+    // dimCountry.region (region_name-prioritized, see buildFactCountryLookup)
+    // must win over the fact row's own `region` — that's typically the
+    // technical Source/merge-lineage tag (e.g. "EU"), not the display region
+    // ("Europe") the filter checkboxes use, and letting it win here is what
+    // silently broke Region-level filtering while Country-level kept working.
+    const region = dimCountry.region || row.region_name || row.region || '';
     const date = normalizeAggDate(row.date ?? row.Date);
 
     const key = `${date} ${region} ${country_name} ${brand} ${platform} ${recall}`;

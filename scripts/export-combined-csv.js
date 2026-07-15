@@ -539,7 +539,10 @@ function enrichFactRows(rows, campaignRows, countryRows) {
     countryLookup.set(iso, {
       country_name: row.country_name ?? row.country,
       region_name: row.region_name ?? row.region,
-      region: row.region ?? row.region_name,
+      // region_name (display, e.g. "Europe") must win over region/Source
+      // (technical merge-lineage tag, e.g. "EU"/"USCA"/"NAR-CN") — those are
+      // deliberately different values in this data model.
+      region: row.region_name ?? row.region,
     });
   }
   return rows.map((row) => {
@@ -557,7 +560,10 @@ function enrichFactRows(rows, campaignRows, countryRows) {
     if (dimCountry) {
       if (!enriched.country_name && dimCountry.country_name) enriched.country_name = dimCountry.country_name;
       if (!enriched.region_name && dimCountry.region_name) enriched.region_name = dimCountry.region_name;
-      if (!enriched.region && dimCountry.region) enriched.region = dimCountry.region;
+      // Always prefer dim_country's resolved region (display name) over
+      // whatever the fact row itself might already carry — that's often the
+      // technical Source tag, not the display region.
+      if (dimCountry.region) enriched.region = dimCountry.region;
     }
     return enriched;
   });
