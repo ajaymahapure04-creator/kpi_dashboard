@@ -933,7 +933,7 @@ function buildFactMainAggregate(factRows, campaignRows, countryRows) {
     const region = row.region || dimCountry.region || row.region_name || '';
     const date = normalizeAggDate(row.date ?? row.Date);
 
-    const key = `${date} ${region} ${country_name} ${brand} ${platform} ${recall}`;
+    const key = `${date} ${region} ${country_name} ${brand} ${platform} ${recall}`;
     let g = groups.get(key);
     if (!g) {
       g = {
