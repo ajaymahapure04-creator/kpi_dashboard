@@ -224,6 +224,8 @@ for (const c of campaigns) {
     const offsetDays = randInt(1, 120);
     const successfulUpdateDate = new Date(new Date(targetedDate).getTime() + offsetDays * 86400000)
       .toISOString().slice(0, 10);
+    const successfulUpdates = Math.round(randInt(500, 15000) * c.scale);
+    const adoptionRate = Math.round((20 + (70 * (i + 1)) / dates.length + randFloat(-4, 4)) * 10) / 10;
     factAdoption.push({
       campaign: c.campaign,
       country_iso: primaryIso,
@@ -233,8 +235,12 @@ for (const c of campaigns) {
       // Real exports carry this pre-computed too — mirrored here so local
       // testing exercises the same "prefer range" path as buildAdoptionRateAggregate.
       range: offsetDays,
-      successful_updates: Math.round(randInt(500, 15000) * c.scale),
-      adoption_rate: Math.round((20 + (70 * (i + 1)) / dates.length + randFloat(-4, 4)) * 10) / 10,
+      successful_updates: successfulUpdates,
+      // Derived from successful_updates/adoption_rate so the two stay
+      // consistent — Adoption Rate KPI = SUM(successful_updates) /
+      // SUM(targeted_per_date) * 100 should reproduce ~adoption_rate.
+      targeted_per_date: Math.round(successfulUpdates / (adoptionRate / 100)),
+      adoption_rate: adoptionRate,
       platform: c.platform,
       updated_technology: c.technology,
       Source: c.region,

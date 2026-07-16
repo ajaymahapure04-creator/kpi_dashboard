@@ -146,14 +146,13 @@ function jsonArrayBuffer(rows) {
 // (500K+ aggregated fact_main rows plus proportionally larger release/
 // adoption tables) big enough to crash the browser tab outright once it
 // finally reached the frontend (see the Overview/DLCM split in App.jsx).
-function buildSnapshotBuffer({ mode, factMainAgg, adoptionAgg, targetedAgg, campaignRows, countryRows, aiRows, filterOptions }) {
+function buildSnapshotBuffer({ mode, factMainAgg, adoptionAgg, campaignRows, countryRows, aiRows, filterOptions }) {
   const factMainBuf = jsonArrayBuffer(factMainAgg);
   return Buffer.concat([
     Buffer.from(`{"mode":${JSON.stringify(mode)}`, 'utf8'),
     Buffer.from(',"fact_main":', 'utf8'), factMainBuf,
     Buffer.from(',"fact_main_enriched":', 'utf8'), factMainBuf,
     Buffer.from(',"fact_adoption_rate_agg":', 'utf8'), jsonArrayBuffer(adoptionAgg || []),
-    Buffer.from(',"fact_targeted_vehicles_agg":', 'utf8'), jsonArrayBuffer(targetedAgg || []),
     Buffer.from(',"dim_campaign":', 'utf8'), jsonArrayBuffer(campaignRows),
     Buffer.from(',"dim_country":', 'utf8'), jsonArrayBuffer(countryRows),
     Buffer.from(',"fact_ai_summaries_latest":', 'utf8'), Buffer.from(JSON.stringify(aiRows), 'utf8'),
@@ -194,24 +193,23 @@ function buildLocalSnapshot() {
   const snapshot = loadLocalDashboardSnapshot(localDataCache);
   const factMainRows = Array.isArray(snapshot.fact_main) ? snapshot.fact_main : [];
   const adoptionRows = Array.isArray(snapshot.fact_adoption_rate) ? snapshot.fact_adoption_rate : [];
-  const targetedRows = Array.isArray(snapshot.fact_targeted_vehicles) ? snapshot.fact_targeted_vehicles : [];
   const campaignRows = Array.isArray(snapshot.dim_campaign) ? snapshot.dim_campaign : [];
   const countryRows = Array.isArray(snapshot.dim_country) ? snapshot.dim_country : [];
   const aiRows = Array.isArray(snapshot.fact_ai_summaries_latest) ? snapshot.fact_ai_summaries_latest : [];
 
   // fact_main is aggregated to a compact cube; the browser reconstructs
   // every KPI/series/delta from the pre-summed components (see App.jsx
-  // valueForKpi). fact_adoption_rate/fact_targeted_vehicles get the same
-  // treatment so Adoption Rate is available immediately, without waiting
-  // for the lazy /api/dlcm_snapshot fetch.
+  // valueForKpi). fact_adoption_rate gets the same treatment (successful_
+  // updates AND targeted_per_date both summed into the same cube — see
+  // buildAdoptionRateAggregate) so Adoption Rate is available immediately,
+  // without waiting for the lazy /api/dlcm_snapshot fetch.
   const factMainAgg = buildFactMainAggregate(factMainRows, campaignRows, countryRows);
   const adoptionAgg = buildAdoptionRateAggregate(adoptionRows, campaignRows, countryRows);
-  const targetedAgg = buildTargetedVehiclesAggregate(targetedRows, campaignRows, countryRows);
   const filterOptions = buildDashboardFilterCatalog(factMainAgg, campaignRows, countryRows);
 
-  const buf = buildSnapshotBuffer({ mode: 'local', factMainAgg, adoptionAgg, targetedAgg, campaignRows, countryRows, aiRows, filterOptions });
+  const buf = buildSnapshotBuffer({ mode: 'local', factMainAgg, adoptionAgg, campaignRows, countryRows, aiRows, filterOptions });
   localSnapshotJsonCache = { gzip: zlib.gzipSync(buf) };
-  console.log(`Local snapshot built: fact_main ${factMainRows.length} rows -> ${factMainAgg.length} aggregated cube rows, fact_adoption_rate ${adoptionRows.length} rows -> ${adoptionAgg.length} aggregated cube rows, fact_targeted_vehicles ${targetedRows.length} rows -> ${targetedAgg.length} aggregated cube rows (${(localSnapshotJsonCache.gzip.length / 1e6).toFixed(1)} MB gzipped).`);
+  console.log(`Local snapshot built: fact_main ${factMainRows.length} rows -> ${factMainAgg.length} aggregated cube rows, fact_adoption_rate ${adoptionRows.length} rows -> ${adoptionAgg.length} aggregated cube rows (${(localSnapshotJsonCache.gzip.length / 1e6).toFixed(1)} MB gzipped).`);
   return localSnapshotJsonCache;
 }
 
@@ -238,10 +236,9 @@ app.get('/api/dashboard_snapshot', async (req, res) => {
       return sendJsonMaybeGzip(req, res, localSnapshotJsonCache);
     }
 
-    const [factMainRows, adoptionRows, targetedRows, campaignRows, countryRows, aiRows] = await Promise.all([
+    const [factMainRows, adoptionRows, campaignRows, countryRows, aiRows] = await Promise.all([
       queryFactMainCombined(0, true),
       queryFactAdoptionRateCombined(0),
-      queryFactTargetedVehiclesCombined(0),
       queryDimCampaignCombined(0),
       queryDimCountryCombined(0),
       queryAiSummariesLatest(0),
@@ -249,11 +246,10 @@ app.get('/api/dashboard_snapshot', async (req, res) => {
 
     const factMainEnriched = enrichFactRows(factMainRows, campaignRows, countryRows);
     const adoptionAgg = buildAdoptionRateAggregate(adoptionRows, campaignRows, countryRows);
-    const targetedAgg = buildTargetedVehiclesAggregate(targetedRows, campaignRows, countryRows);
     const filterOptions = buildDashboardFilterCatalog(factMainRows, campaignRows, countryRows);
 
     const buf = buildSnapshotBuffer({
-      mode: 'live', factMainAgg: factMainEnriched, adoptionAgg, targetedAgg, campaignRows, countryRows, aiRows, filterOptions,
+      mode: 'live', factMainAgg: factMainEnriched, adoptionAgg, campaignRows, countryRows, aiRows, filterOptions,
     });
     return sendJsonMaybeGzip(req, res, { gzip: zlib.gzipSync(buf) });
   } catch (error) {
@@ -997,8 +993,11 @@ function buildFactMainAggregate(factRows, campaignRows, countryRows) {
   return Array.from(groups.values());
 }
 
-// Adoption Rate KPI = SUM(successful_updates) from fact_adoption_rate WHERE
-// (successful_update_date - targeted_date) <= 60 days. Aggregated the same
+// Adoption Rate KPI = SUM(successful_updates) / SUM(targeted_per_date) from
+// fact_adoption_rate WHERE (successful_update_date - targeted_date) <= 60
+// days. Both components live on the same row-level table (and therefore the
+// same date), unlike the old fact_targeted_vehicles-based denominator, which
+// was a separate, dateless per-campaign target table. Aggregated the same
 // way as fact_main (small cube, not raw rows) so it can ship in the eager
 // /api/dashboard_snapshot response — fact_adoption_rate's row-level data is
 // still only fetched lazily via /api/dlcm_snapshot for the DLCM adoption
@@ -1044,43 +1043,11 @@ function buildAdoptionRateAggregate(adoptionRows, campaignRows, countryRows) {
     const key = `${date} ${region} ${country_name} ${brand} ${platform} ${recall}`;
     let g = groups.get(key);
     if (!g) {
-      g = { date, region, country_name, brand, platform, recall, _agg: 1, successful_updates: 0 };
+      g = { date, region, country_name, brand, platform, recall, _agg: 1, successful_updates: 0, targeted_per_date: 0 };
       groups.set(key, g);
     }
     g.successful_updates += toNum(row.successful_updates);
-  }
-
-  return Array.from(groups.values());
-}
-
-// fact_targeted_vehicles has no date column at all (it's a static per-
-// campaign target, not a time series) — grouped by region/country/brand/
-// platform/recall only. Adoption Rate = SUM(successful_updates, from the
-// cube above) / SUM(targeted_vehicles, from this cube) * 100.
-function buildTargetedVehiclesAggregate(targetedRows, campaignRows, countryRows) {
-  const campaignLookup = buildFactCampaignLookup(campaignRows);
-  const countryLookup = buildFactCountryLookup(countryRows);
-  const groups = new Map();
-
-  for (const row of targetedRows) {
-    const campaignKey = normalizeFactCampaignKey(row);
-    const dimCampaign = campaignLookup.get(campaignKey) || {};
-    const countryIso = normalizeJoinKey(row.country_iso ?? row.country ?? row.iso);
-    const dimCountry = (countryIso ? countryLookup.get(countryIso) : undefined) || {};
-
-    const brand = row.brand || dimCampaign.brand || '';
-    const platform = row.platform || dimCampaign.platform || '';
-    const recall = row.recall || dimCampaign.recall || campaignKey || '';
-    const country_name = row.country_name || dimCountry.country_name || row.country || '';
-    const region = dimCountry.region || row.region_name || row.region || '';
-
-    const key = `${region} ${country_name} ${brand} ${platform} ${recall}`;
-    let g = groups.get(key);
-    if (!g) {
-      g = { region, country_name, brand, platform, recall, _agg: 1, targeted_vehicles: 0 };
-      groups.set(key, g);
-    }
-    g.targeted_vehicles += toNum(row.targeted_vehicles);
+    g.targeted_per_date += toNum(row.targeted_per_date);
   }
 
   return Array.from(groups.values());
