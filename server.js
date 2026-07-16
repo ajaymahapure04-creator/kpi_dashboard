@@ -1006,11 +1006,22 @@ function buildAdoptionRateAggregate(adoptionRows, campaignRows, countryRows) {
   for (const row of adoptionRows) {
     const targetedRaw = row.targeted_date ?? row.TargetedDate;
     const successfulRaw = row.successful_update_date ?? row.SuccessfulUpdateDate;
-    if (!targetedRaw || !successfulRaw) continue;
-    const targeted = new Date(normalizeTimestampString(String(targetedRaw).trim().replace(/^"+|"+$/g, '')));
-    const successful = new Date(normalizeTimestampString(String(successfulRaw).trim().replace(/^"+|"+$/g, '')));
-    if (Number.isNaN(targeted.valueOf()) || Number.isNaN(successful.valueOf())) continue;
-    const rangeDays = (successful.valueOf() - targeted.valueOf()) / (24 * 60 * 60 * 1000);
+    if (!successfulRaw) continue;
+
+    // Real exports already carry a `range` column — prefer it over
+    // recomputing from the two dates (avoids any date-parsing mismatch).
+    // Only fall back to the date difference if `range` is genuinely absent
+    // (parseRangeRaw returns null, not 0 — a missing value must not be
+    // silently treated as "0 days", which would wrongly count as eligible).
+    const rangeRaw = row.range ?? row.Range;
+    let rangeDays = rangeRaw === undefined || rangeRaw === null || rangeRaw === '' ? null : Number(rangeRaw);
+    if (rangeDays === null || Number.isNaN(rangeDays)) {
+      if (!targetedRaw) continue;
+      const targeted = new Date(normalizeTimestampString(String(targetedRaw).trim().replace(/^"+|"+$/g, '')));
+      const successful = new Date(normalizeTimestampString(String(successfulRaw).trim().replace(/^"+|"+$/g, '')));
+      if (Number.isNaN(targeted.valueOf()) || Number.isNaN(successful.valueOf())) continue;
+      rangeDays = (successful.valueOf() - targeted.valueOf()) / (24 * 60 * 60 * 1000);
+    }
     if (rangeDays > 60) continue;
 
     const campaignKey = normalizeFactCampaignKey(row);

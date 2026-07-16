@@ -230,6 +230,9 @@ for (const c of campaigns) {
       date,
       targeted_date: targetedDate,
       successful_update_date: successfulUpdateDate,
+      // Real exports carry this pre-computed too — mirrored here so local
+      // testing exercises the same "prefer range" path as buildAdoptionRateAggregate.
+      range: offsetDays,
       successful_updates: Math.round(randInt(500, 15000) * c.scale),
       adoption_rate: Math.round((20 + (70 * (i + 1)) / dates.length + randFloat(-4, 4)) * 10) / 10,
       platform: c.platform,
