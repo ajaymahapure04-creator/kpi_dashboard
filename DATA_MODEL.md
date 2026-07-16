@@ -40,14 +40,34 @@ Databricks, add them to **both** merge lists.
 
 ### KPI usage
 
-`fact_main` drives the primary and secondary KPIs on the frontend:
+`fact_main` drives most primary/secondary KPIs. Every KPI is a sum or a
+ratio-of-sums over the whole filtered scope, never a per-row average of
+per-row ratios (see `valueForKpiAgg`/`valueForKpi` in `src/App.jsx`):
 
-- **Successful vehicle updates** — `successful_updates`
-- **Quality** — `quality`
-- **Liegenbleiber** — the `lb_*` columns (`lb_common_vehicles`,
-  `lb_backend_vehicles`, `lb_aftersales_vehicles`)
-- **CO2 savings** — `co2_savings`
-- **Cost savings** — `cost_savings`
+- **Successful vehicle updates** = `SUM(successful_updates)`
+- **Quality** = `(SUM(quality) / SUM(successful_updates)) * 1000` — errors
+  per 1k successful updates
+- **Liegenbleiber** = `(SUM(lb_common_vehicles + lb_backend_vehicles +
+  lb_aftersales_vehicles) / SUM(successful_updates)) * 1000`
+- **Installation Duration** = `SUM(downtime_minutes) / SUM(update_operations)`
+  — `downtime_minutes` is the row's *total* minutes across all its
+  operations, not a single-instance sample to average directly
+- **CO2 savings** = `SUM(co2_savings)`
+- **Cost savings** = `SUM(cost_savings)`
+
+**Adoption Rate** is the one KPI *not* sourced from `fact_main` — it comes
+from `fact_adoption_rate`, using two columns real Databricks exports carry
+(`targeted_date`, `successful_update_date`) that the local CSV export/mock
+generator previously omitted:
+
+- Adoption Rate = `SUM(successful_updates)` **where**
+  `(successful_update_date - targeted_date) <= 60 days`
+- Aggregated server-side into its own small cube
+  (`buildAdoptionRateAggregate` in `server.js`) at the same grain as
+  `fact_main`'s cube (date × region × country × brand × platform × recall),
+  shipped eagerly in `/api/dashboard_snapshot` as `fact_adoption_rate_agg` —
+  row-level `fact_adoption_rate` is still only fetched lazily via
+  `/api/dlcm_snapshot`, for the DLCM adoption-curve chart specifically.
 
 `fact_ai_summaries_facts_v3_int` is the odd one out: it is not a regional
 merge. It reads **all** data in Databricks and stores generated summaries per
@@ -296,7 +316,7 @@ use these names; every API route maps onto one of them via
 | File | Notes |
 |---|---|
 | `fact_main.csv` | primary/secondary KPIs |
-| `fact_adoption_rate.csv` | |
+| `fact_adoption_rate.csv` | Adoption Rate KPI — needs `targeted_date`, `successful_update_date`, `successful_updates` (see KPI usage above) |
 | `fact_ecu.csv` | EU-only by design |
 | `fact_targeted_vehicles.csv` | |
 | `fact_release.csv` | |

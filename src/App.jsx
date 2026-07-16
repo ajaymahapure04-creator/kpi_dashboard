@@ -406,13 +406,13 @@ const KPIS = [
     id: "adoption",
     tier: "secondary",
     title: "Adoption Rate",
-    unitLabel: "",
-    value: "35%",
-    d7: "0.0%", d30: "0.0%",
+    unitLabel: "vehicles updated within 60 days of target",
+    value: "0",
+    d7: "+0", d30: "+0",
     goodWhen: "up",
     icon: Users,
     seed: 41, base: 34.2, vol: 0.5, drift: 0.02,
-    detailNote: "Share of eligible vehicles that installed the latest offered release",
+    detailNote: "Successful updates completed within 60 days of the targeted date",
     anomalies: [
       { sev: "warn", text: "Adoption flat for 30 days — consent-screen drop-off at 41% suggests UX friction in the in-car prompt." },
     ],
@@ -566,24 +566,26 @@ function valueForKpiAgg(rows, kpiId) {
     case "updates":
       return sum("successful_updates");
     case "quality": {
+      // (SUM(quality) / SUM(successful_updates)) * 1000
       const totalUpdates = sum("successful_updates");
-      if (totalUpdates) return sum("_quality_weight") / totalUpdates;
-      const n = sum("_n");
-      return n ? sum("_quality_sum") / n : null;
+      return totalUpdates ? (sum("_quality_sum") / totalUpdates) * 1000 : null;
     }
     case "liegenbleiber": {
+      // ((SUM(lb_common+lb_backend+lb_aftersales)) / SUM(successful_updates)) * 1000
       const totalUpdates = sum("successful_updates");
-      const totalWarnings = sum("customerWarning_minor") + sum("customerWarning_major");
-      return totalUpdates ? (totalWarnings / totalUpdates) * 1000 : null;
+      const lb = sum("lb_common_vehicles") + sum("lb_backend_vehicles") + sum("lb_aftersales_vehicles");
+      return totalUpdates ? (lb / totalUpdates) * 1000 : null;
     }
-    case "adoption": {
-      const installs = sum("update_operations");
-      const eligible = sum("lb_common_vehicles") + sum("lb_backend_vehicles") + sum("lb_aftersales_vehicles");
-      return eligible ? (installs / eligible) * 100 : null;
-    }
+    case "adoption":
+      // SUM(successful_updates) from fact_adoption_rate, already pre-filtered
+      // server-side to rows where (successful_update_date - targeted_date)
+      // <= 60 days — see buildAdoptionRateAggregate in server.js. `rows` here
+      // is the adoption cube, not the fact_main cube (see rowsForKpi).
+      return sum("successful_updates");
     case "duration": {
-      const n = sum("_n");
-      return n ? sum("downtime_minutes") / n : null;
+      // SUM(installation_duration i.e. downtime_minutes) / SUM(update_operations)
+      const installs = sum("update_operations");
+      return installs ? sum("downtime_minutes") / installs : null;
     }
     case "cost":
       return sum("cost_savings");
@@ -601,26 +603,27 @@ function valueForKpi(rows, kpiId) {
     case "updates":
       return sumField(rows, ["successful_updates"]);
     case "quality": {
+      // (SUM(quality) / SUM(successful_updates)) * 1000
       const totalUpdates = sumField(rows, ["successful_updates"]);
-      const weightedQuality = rows.reduce((sum, row) => {
-        const quality = getNumericField(row, ["quality"]);
-        const updates = getNumericField(row, ["successful_updates"]);
-        return sum + quality * updates;
-      }, 0);
-      return totalUpdates ? weightedQuality / totalUpdates : averageField(rows, ["quality"]);
+      const totalQuality = sumField(rows, ["quality"]);
+      return totalUpdates ? (totalQuality / totalUpdates) * 1000 : null;
     }
     case "liegenbleiber": {
+      // ((SUM(lb_common+lb_backend+lb_aftersales)) / SUM(successful_updates)) * 1000
       const totalUpdates = sumField(rows, ["successful_updates"]);
-      const totalWarnings = sumField(rows, ["customerWarning_minor", "customerWarning_major"]);
-      return totalUpdates ? (totalWarnings / totalUpdates) * 1000 : null;
+      const lb = sumField(rows, ["lb_common_vehicles", "lb_backend_vehicles", "lb_aftersales_vehicles"]);
+      return totalUpdates ? (lb / totalUpdates) * 1000 : null;
     }
-    case "adoption": {
+    case "adoption":
+      // SUM(successful_updates) from fact_adoption_rate rows already
+      // pre-filtered to the 60-day eligibility window (see rowsForKpi).
+      return sumField(rows, ["successful_updates"]);
+    case "duration": {
+      // SUM(installation_duration i.e. downtime_minutes) / SUM(update_operations)
       const installs = sumField(rows, ["update_operations"]);
-      const eligible = sumField(rows, ["lb_common_vehicles", "lb_backend_vehicles", "lb_aftersales_vehicles"]);
-      return eligible ? (installs / eligible) * 100 : null;
+      const duration = sumField(rows, ["downtime_minutes"]);
+      return installs ? duration / installs : null;
     }
-    case "duration":
-      return averageField(rows, ["downtime_minutes"]);
     case "cost":
       return sumField(rows, ["cost_savings"]);
     case "co2":
@@ -640,7 +643,6 @@ function formatKpiValue(value, kpiId) {
     case "duration":
       return `${value.toFixed(1)}`;
     case "adoption":
-      return `${value.toFixed(1)}%`;
     case "cost":
     case "co2":
       return formatLargeNumber(value);
@@ -657,9 +659,8 @@ function formatKpiDelta(delta, kpiId) {
     case "updates":
     case "cost":
     case "co2":
-      return `${sign}${formatLargeNumber(abs)}`;
     case "adoption":
-      return `${sign}${abs.toFixed(1)}%`;
+      return `${sign}${formatLargeNumber(abs)}`;
     default:
       return `${sign}${abs.toFixed(1)}`;
   }
@@ -691,6 +692,12 @@ function deltaForKpi(rows, kpiId, days) {
   const b = valueForKpi(prev, kpiId);
   if (a == null || b == null) return null;
   return a - b;
+}
+
+// Adoption Rate is computed from fact_adoption_rate's own cube, not
+// fact_main — every other KPI here uses fact_main's.
+function rowsForKpi(kpiId, factMainRows, adoptionRows) {
+  return kpiId === "adoption" ? adoptionRows : factMainRows;
 }
 
 function runtimeKpi(kpi, rows) {
@@ -736,14 +743,17 @@ function buildKpiSeries(rows, kpiId, range) {
 
 function buildKpiBreakdown(rows, kpiId, dimension) {
   if (!rows || !rows.length) return [];
+  // Ratio-based KPIs (quality, liegenbleiber, duration) must be computed once
+  // over each group's rows, not per-row-then-summed — summing per-row ratios
+  // is not the same as the group's true ratio-of-sums.
   const groups = new Map();
   for (const row of rows) {
     const key = row[dimension] ?? row[dimension.charAt(0).toUpperCase() + dimension.slice(1)] ?? "Unknown";
-    const current = groups.get(key) || 0;
-    groups.set(key, current + (valueForKpi([row], kpiId) ?? 0));
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(row);
   }
   return Array.from(groups.entries())
-    .map(([name, value]) => ({ name, value }))
+    .map(([name, groupRows]) => ({ name, value: valueForKpi(groupRows, kpiId) ?? 0 }))
     .sort((a, b) => b.value - a.value);
 }
 
@@ -1331,7 +1341,7 @@ function DlcmLink({ icon: Icon, l1, l2, disabled, onClick }) {
   );
 }
 
-function Overview({ onOpen, onDlcm, filters, filteredRows, aiSummaries }) {
+function Overview({ onOpen, onDlcm, filters, filteredRows, filteredAdoptionAggRows, aiSummaries }) {
   // Each primary card's insight is the top-ranked AI summary compatible with
   // this KPI and the active region/brand/platform filters. No match (e.g. a
   // filter combination the AI summaries don't cover) means no insight —
@@ -1340,8 +1350,8 @@ function Overview({ onOpen, onDlcm, filters, filteredRows, aiSummaries }) {
     const s = summariesMatchingScope(aiSummaries, k.id, filters)[0];
     return { ...k, insight: s ? (s.headline || s.fact) : "", insightMeta: s ? formatInsightMeta(s) : "" };
   };
-  const primaries = KPIS.filter((k) => k.tier === "primary").map((k) => withLiveInsight(runtimeKpi(k, filteredRows)));
-  const secondaries = KPIS.filter((k) => k.tier === "secondary").map((k) => runtimeKpi(k, filteredRows));
+  const primaries = KPIS.filter((k) => k.tier === "primary").map((k) => withLiveInsight(runtimeKpi(k, rowsForKpi(k.id, filteredRows, filteredAdoptionAggRows))));
+  const secondaries = KPIS.filter((k) => k.tier === "secondary").map((k) => runtimeKpi(k, rowsForKpi(k.id, filteredRows, filteredAdoptionAggRows)));
   return (
     <div className="px-4 py-1.5 flex flex-col gap-1.5" style={{ minHeight: "100%" }}>
       <section className="flex-[4] min-h-0 flex flex-col">
@@ -1407,15 +1417,16 @@ function NoData({ label = "No data for the current filter selection" }) {
   );
 }
 
-function Detail({ kpiId, onBack, filters, filteredRows, aiSummaries }) {
+function Detail({ kpiId, onBack, filters, filteredRows, filteredAdoptionAggRows, aiSummaries }) {
   const scope = filterScope(filters);
-  const kpi = runtimeKpi(KPIS.find((k) => k.id === kpiId), filteredRows);
+  const kpiRows = rowsForKpi(kpiId, filteredRows, filteredAdoptionAggRows);
+  const kpi = runtimeKpi(KPIS.find((k) => k.id === kpiId), kpiRows);
   const [range, setRange] = useState(30);
   // Charts render backend rows only — an empty result shows an empty state,
   // never a synthetic series.
-  const series = useMemo(() => buildKpiSeries(filteredRows, kpiId, range), [filteredRows, kpiId, range]);
-  const byBrand = useMemo(() => buildKpiBreakdown(filteredRows, kpiId, "brand"), [filteredRows, kpiId]);
-  const byRegion = useMemo(() => buildKpiBreakdown(filteredRows, kpiId, "region"), [filteredRows, kpiId]);
+  const series = useMemo(() => buildKpiSeries(kpiRows, kpiId, range), [kpiRows, kpiId, range]);
+  const byBrand = useMemo(() => buildKpiBreakdown(kpiRows, kpiId, "brand"), [kpiRows, kpiId]);
+  const byRegion = useMemo(() => buildKpiBreakdown(kpiRows, kpiId, "region"), [kpiRows, kpiId]);
   // Only summaries compatible with this KPI and the active region/brand/
   // platform filters — a mismatched selection yields [], not a fallback.
   const summaries = useMemo(
@@ -1803,6 +1814,7 @@ export default function App() {
   const [countryRows, setCountryRows] = useState([]);
   const [releaseRows, setReleaseRows] = useState([]);
   const [adoptionRows, setAdoptionRows] = useState([]);
+  const [adoptionAggRows, setAdoptionAggRows] = useState([]);
   const [aiSummaries, setAiSummaries] = useState([]);
   const [dataMode, setDataMode] = useState(null); // "live" | "local" | null (unknown yet)
   const [backendError, setBackendError] = useState(null);
@@ -1870,6 +1882,16 @@ export default function App() {
     [enrichedRows, filters]
   );
 
+  // Adoption Rate's own small cube (see buildAdoptionRateAggregate in
+  // server.js) — already resolved to region/country_name/brand/platform/
+  // recall server-side and already filtered to the 60-day eligibility
+  // window, so it only needs the same cross-filter/date-range pass as
+  // filteredRows, not enrichRow.
+  const filteredAdoptionAggRows = useMemo(
+    () => adoptionAggRows.filter((row) => matchesRowFilters(row, filters)),
+    [adoptionAggRows, filters]
+  );
+
   const filteredReleaseRows = useMemo(() => {
     const rows = releaseRows.some((row) => row.brand !== undefined || row.country_name !== undefined || row.region !== undefined || row.recall !== undefined)
       ? releaseRows
@@ -1914,6 +1936,7 @@ export default function App() {
         if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
         const snapshot = await response.json();
         setBackendRows(Array.isArray(snapshot.fact_main) ? snapshot.fact_main : []);
+        setAdoptionAggRows(Array.isArray(snapshot.fact_adoption_rate_agg) ? snapshot.fact_adoption_rate_agg : []);
         setCampaignRows(Array.isArray(snapshot.dim_campaign) ? snapshot.dim_campaign : []);
         setCountryRows(Array.isArray(snapshot.dim_country) ? snapshot.dim_country : []);
         setAiSummaries(Array.isArray(snapshot.fact_ai_summaries_latest) ? snapshot.fact_ai_summaries_latest : []);
@@ -2075,6 +2098,7 @@ export default function App() {
             <Overview
               filters={filters}
               filteredRows={filteredRows}
+              filteredAdoptionAggRows={filteredAdoptionAggRows}
               aiSummaries={aiSummaries}
               onOpen={(kpiId) => setRoute({ page: "detail", kpiId })}
               onDlcm={(name) => setRoute({ page: "dlcm", name })}
@@ -2082,6 +2106,7 @@ export default function App() {
           )}
           {route.page === "detail" && (
             <Detail kpiId={route.kpiId} filters={filters} filteredRows={filteredRows}
+              filteredAdoptionAggRows={filteredAdoptionAggRows}
               aiSummaries={aiSummaries} onBack={goHome} />
           )}
           {route.page === "dlcm" && dlcmLoading && <NoData label="Loading DLCM release data…" />}

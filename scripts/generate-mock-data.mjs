@@ -130,9 +130,12 @@ for (const c of campaigns) {
     for (const date of dates) {
       const updates = Math.round(randInt(200, 8000) * c.scale);
       const operations = Math.round(updates * randFloat(1.05, 1.2));
-      const eligible = Math.round(operations / randFloat(0.55, 0.9));
       const minor = Math.round(updates * randFloat(0.002, 0.008));
       const major = Math.round(updates * randFloat(0.0005, 0.002));
+      // Liegenbleiber (lb_*) is a rate metric — errors per 1k successful
+      // updates, target ~0.6-1k — so the three channels must sum to a small
+      // fraction of `updates`, not a multiple of it.
+      const lbTotal = Math.round(updates * randFloat(0.0003, 0.0012));
       factMain.push({
         campaign: c.campaign,
         brand: c.brand,
@@ -140,12 +143,18 @@ for (const c of campaigns) {
         wave: c.wave,
         date,
         successful_updates: updates,
-        quality: randInt(90, 99),
-        downtime_minutes: randInt(20, 75),
+        // Quality KPI = SUM(quality)/SUM(successful_updates)*1000, so this is
+        // an error COUNT per row (target ~3.9/1k), not a 0-100 score.
+        quality: Math.round(updates * randFloat(0.002, 0.006)),
+        // Installation Duration KPI = SUM(downtime_minutes)/SUM(update_operations),
+        // so downtime_minutes is the row's TOTAL minutes across all its
+        // operations (operations * a plausible per-operation duration),
+        // not a single-instance sample to be averaged directly.
+        downtime_minutes: Math.round(operations * randFloat(55, 75)),
         update_operations: operations,
-        lb_common_vehicles: Math.round(eligible * 0.7),
-        lb_backend_vehicles: Math.round(eligible * 0.2),
-        lb_aftersales_vehicles: Math.round(eligible * 0.1),
+        lb_common_vehicles: Math.round(lbTotal * 0.7),
+        lb_backend_vehicles: Math.round(lbTotal * 0.2),
+        lb_aftersales_vehicles: Math.round(lbTotal * 0.1),
         cost_savings: Math.round(updates * randFloat(30, 45) * 100) / 100,
         co2_savings: Math.round(updates * randFloat(0.010, 0.016) * 1000) / 1000,
         platform: c.platform,
@@ -206,10 +215,22 @@ for (const c of campaigns) {
   const primaryIso = c.countries[0][0];
   const dates = weeklyDates(10);
   dates.forEach((date, i) => {
+    // Adoption Rate KPI = SUM(successful_updates) WHERE
+    // (successful_update_date - targeted_date) <= 60 days. `date` is the
+    // week a batch was targeted; successful_update_date is when that batch
+    // actually completed, offset by 1-120 days so some rows fall outside
+    // the 60-day eligibility window and the filter has something to do.
+    const targetedDate = date;
+    const offsetDays = randInt(1, 120);
+    const successfulUpdateDate = new Date(new Date(targetedDate).getTime() + offsetDays * 86400000)
+      .toISOString().slice(0, 10);
     factAdoption.push({
       campaign: c.campaign,
       country_iso: primaryIso,
       date,
+      targeted_date: targetedDate,
+      successful_update_date: successfulUpdateDate,
+      successful_updates: Math.round(randInt(500, 15000) * c.scale),
       adoption_rate: Math.round((20 + (70 * (i + 1)) / dates.length + randFloat(-4, 4)) * 10) / 10,
       platform: c.platform,
       updated_technology: c.technology,
