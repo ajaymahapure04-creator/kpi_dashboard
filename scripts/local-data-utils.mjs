@@ -123,6 +123,7 @@ export function loadLocalDashboardSnapshot(cache = new Map()) {
     dim_country: loadLocalDataRows('dim_country', cache) || [],
     fact_release: loadLocalDataRows('fact_release', cache) || [],
     fact_adoption_rate: loadLocalDataRows('fact_adoption_rate', cache) || [],
+    fact_targeted_vehicles: loadLocalDataRows('fact_targeted_vehicles', cache) || [],
     fact_ai_summaries_latest: loadLocalDataRows('fact_ai_summaries_latest', cache) || [],
   };
 

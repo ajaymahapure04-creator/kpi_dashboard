@@ -55,19 +55,28 @@ per-row ratios (see `valueForKpiAgg`/`valueForKpi` in `src/App.jsx`):
 - **CO2 savings** = `SUM(co2_savings)`
 - **Cost savings** = `SUM(cost_savings)`
 
-**Adoption Rate** is the one KPI *not* sourced from `fact_main` — it comes
-from `fact_adoption_rate`, using two columns real Databricks exports carry
-(`targeted_date`, `successful_update_date`) that the local CSV export/mock
-generator previously omitted:
+**Adoption Rate** is the one KPI *not* sourced solely from `fact_main` — its
+numerator comes from `fact_adoption_rate` (real exports carry `targeted_date`,
+`successful_update_date`, and a pre-computed `range` column — the local
+mock generator mirrors all three), its denominator from
+`fact_targeted_vehicles`:
 
-- Adoption Rate = `SUM(successful_updates)` **where**
-  `(successful_update_date - targeted_date) <= 60 days`
-- Aggregated server-side into its own small cube
-  (`buildAdoptionRateAggregate` in `server.js`) at the same grain as
-  `fact_main`'s cube (date × region × country × brand × platform × recall),
-  shipped eagerly in `/api/dashboard_snapshot` as `fact_adoption_rate_agg` —
-  row-level `fact_adoption_rate` is still only fetched lazily via
-  `/api/dlcm_snapshot`, for the DLCM adoption-curve chart specifically.
+- Adoption Rate = `SUM(successful_updates` from `fact_adoption_rate` **where**
+  `range <= 60 days) / SUM(targeted_vehicles` from `fact_targeted_vehicles) * 100`
+- `range` (prefer the real column) falls back to
+  `successful_update_date - targeted_date` in days only if `range` is absent.
+- The two tables are aggregated into two *separate* small cubes
+  (`buildAdoptionRateAggregate`/`buildTargetedVehiclesAggregate` in
+  `server.js`), because they have different grains — `fact_adoption_rate`
+  carries a date (used for the trend chart), `fact_targeted_vehicles` is a
+  static per-campaign target with no date at all. Both ship eagerly in
+  `/api/dashboard_snapshot` (`fact_adoption_rate_agg` /
+  `fact_targeted_vehicles_agg`); row-level `fact_adoption_rate` is still only
+  fetched lazily via `/api/dlcm_snapshot`, for the DLCM adoption-curve chart.
+- Computed by its own function family in `src/App.jsx`
+  (`valueForAdoptionRate`/`deltaForAdoptionRate`/`buildAdoptionRateSeries`/
+  `buildAdoptionRateBreakdown`) rather than the generic single-array
+  `valueForKpi`, since it needs two row arrays at once.
 
 `fact_ai_summaries_facts_v3_int` is the odd one out: it is not a regional
 merge. It reads **all** data in Databricks and stores generated summaries per
@@ -318,7 +327,7 @@ use these names; every API route maps onto one of them via
 | `fact_main.csv` | primary/secondary KPIs |
 | `fact_adoption_rate.csv` | Adoption Rate KPI — needs `targeted_date`, `successful_update_date`, `successful_updates` (see KPI usage above) |
 | `fact_ecu.csv` | EU-only by design |
-| `fact_targeted_vehicles.csv` | |
+| `fact_targeted_vehicles.csv` | Adoption Rate KPI denominator (`targeted_vehicles`) |
 | `fact_release.csv` | |
 | `dim_campaign.csv` | one row per campaign |
 | `dim_country.csv` | 42 rows: 38 European countries + US + CA + NAR + CN |

@@ -406,13 +406,13 @@ const KPIS = [
     id: "adoption",
     tier: "secondary",
     title: "Adoption Rate",
-    unitLabel: "vehicles updated within 60 days of target",
-    value: "0",
-    d7: "+0", d30: "+0",
+    unitLabel: "",
+    value: "0.0%",
+    d7: "+0.0%", d30: "+0.0%",
     goodWhen: "up",
     icon: Users,
     seed: 41, base: 34.2, vol: 0.5, drift: 0.02,
-    detailNote: "Successful updates completed within 60 days of the targeted date",
+    detailNote: "Successful updates within 60 days of target, as a share of targeted vehicles",
     anomalies: [
       { sev: "warn", text: "Adoption flat for 30 days — consent-screen drop-off at 41% suggests UX friction in the in-car prompt." },
     ],
@@ -576,12 +576,6 @@ function valueForKpiAgg(rows, kpiId) {
       const lb = sum("lb_common_vehicles") + sum("lb_backend_vehicles") + sum("lb_aftersales_vehicles");
       return totalUpdates ? (lb / totalUpdates) * 1000 : null;
     }
-    case "adoption":
-      // SUM(successful_updates) from fact_adoption_rate, already pre-filtered
-      // server-side to rows where (successful_update_date - targeted_date)
-      // <= 60 days — see buildAdoptionRateAggregate in server.js. `rows` here
-      // is the adoption cube, not the fact_main cube (see rowsForKpi).
-      return sum("successful_updates");
     case "duration": {
       // SUM(installation_duration i.e. downtime_minutes) / SUM(update_operations)
       const installs = sum("update_operations");
@@ -614,10 +608,6 @@ function valueForKpi(rows, kpiId) {
       const lb = sumField(rows, ["lb_common_vehicles", "lb_backend_vehicles", "lb_aftersales_vehicles"]);
       return totalUpdates ? (lb / totalUpdates) * 1000 : null;
     }
-    case "adoption":
-      // SUM(successful_updates) from fact_adoption_rate rows already
-      // pre-filtered to the 60-day eligibility window (see rowsForKpi).
-      return sumField(rows, ["successful_updates"]);
     case "duration": {
       // SUM(installation_duration i.e. downtime_minutes) / SUM(update_operations)
       const installs = sumField(rows, ["update_operations"]);
@@ -633,6 +623,91 @@ function valueForKpi(rows, kpiId) {
   }
 }
 
+// Adoption Rate = SUM(successful_updates from fact_adoption_rate, already
+// pre-filtered server-side to the 60-day eligibility window) / SUM
+// (targeted_vehicles from fact_targeted_vehicles) * 100. Unlike every other
+// KPI, its two components come from two different tables at two different
+// grains — adoptionRows carry a date, targetedRows don't (a static
+// per-campaign target, not a time series) — so it can't fit the single-
+// array ratio-of-sums pattern above and gets its own small function family
+// mirroring runtimeKpi/deltaForKpi/buildKpiSeries/buildKpiBreakdown.
+function valueForAdoptionRate(adoptionRows, targetedRows) {
+  const successful = sumField(adoptionRows || [], ["successful_updates"]);
+  const targeted = sumField(targetedRows || [], ["targeted_vehicles"]);
+  return targeted ? (successful / targeted) * 100 : null;
+}
+
+function deltaForAdoptionRate(adoptionRows, targetedRows, days) {
+  const targeted = sumField(targetedRows || [], ["targeted_vehicles"]);
+  if (!targeted || !adoptionRows || !adoptionRows.length) return null;
+  const DAY = 24 * 60 * 60 * 1000;
+  const dated = [];
+  for (const row of adoptionRows) {
+    const parsed = parseBackendDate(row.date ?? row.Date);
+    if (parsed) dated.push({ row, time: parsed.valueOf() });
+  }
+  if (!dated.length) return null;
+  let end = -Infinity;
+  for (const d of dated) if (d.time > end) end = d.time;
+  const currStart = end - days * DAY;
+  const prevStart = end - 2 * days * DAY;
+  const curr = dated.filter((d) => d.time > currStart).map((d) => d.row);
+  const prev = dated.filter((d) => d.time > prevStart && d.time <= currStart).map((d) => d.row);
+  if (!curr.length || !prev.length) return null;
+  // Same fixed denominator for both windows, so the delta reduces to the
+  // change in successful updates over the target — no need to compute and
+  // subtract two ratios.
+  const currSuccessful = sumField(curr, ["successful_updates"]);
+  const prevSuccessful = sumField(prev, ["successful_updates"]);
+  return ((currSuccessful - prevSuccessful) / targeted) * 100;
+}
+
+function buildAdoptionRateSeries(adoptionRows, targetedRows, range) {
+  if (!adoptionRows || !adoptionRows.length) return [];
+  const targeted = sumField(targetedRows || [], ["targeted_vehicles"]);
+  const dateMap = new Map();
+  for (const row of adoptionRows) {
+    const parsed = parseBackendDate(row.date ?? row.Date);
+    if (!parsed) continue;
+    const key = parsed.toISOString().slice(0, 10);
+    const bucket = dateMap.get(key) || [];
+    bucket.push(row);
+    dateMap.set(key, bucket);
+  }
+  const series = Array.from(dateMap.entries())
+    .map(([key, bucket]) => ({
+      date: new Date(key),
+      value: targeted ? (sumField(bucket, ["successful_updates"]) / targeted) * 100 : 0,
+    }))
+    .sort((a, b) => a.date - b.date);
+  const trimmed = range && series.length > range ? series.slice(-range) : series;
+  return trimmed.map((item) => ({
+    date: item.date.toLocaleDateString("en-GB", { day: "2-digit", month: "short" }),
+    value: Number(item.value.toFixed(2)),
+  }));
+}
+
+function buildAdoptionRateBreakdown(adoptionRows, targetedRows, dimension) {
+  if (!adoptionRows || !adoptionRows.length) return [];
+  const groupKey = (row) => row[dimension] ?? row[dimension.charAt(0).toUpperCase() + dimension.slice(1)] ?? "Unknown";
+  const successByGroup = new Map();
+  for (const row of adoptionRows) {
+    const key = groupKey(row);
+    successByGroup.set(key, (successByGroup.get(key) || 0) + (Number(row.successful_updates) || 0));
+  }
+  const targetByGroup = new Map();
+  for (const row of targetedRows || []) {
+    const key = groupKey(row);
+    targetByGroup.set(key, (targetByGroup.get(key) || 0) + (Number(row.targeted_vehicles) || 0));
+  }
+  return Array.from(successByGroup.keys())
+    .map((name) => {
+      const targeted = targetByGroup.get(name) || 0;
+      return { name, value: targeted ? (successByGroup.get(name) / targeted) * 100 : 0 };
+    })
+    .sort((a, b) => b.value - a.value);
+}
+
 function formatKpiValue(value, kpiId) {
   if (value == null || Number.isNaN(value)) return "N/A";
   switch (kpiId) {
@@ -643,6 +718,7 @@ function formatKpiValue(value, kpiId) {
     case "duration":
       return `${value.toFixed(1)}`;
     case "adoption":
+      return `${value.toFixed(1)}%`;
     case "cost":
     case "co2":
       return formatLargeNumber(value);
@@ -659,8 +735,9 @@ function formatKpiDelta(delta, kpiId) {
     case "updates":
     case "cost":
     case "co2":
-    case "adoption":
       return `${sign}${formatLargeNumber(abs)}`;
+    case "adoption":
+      return `${sign}${abs.toFixed(1)}%`;
     default:
       return `${sign}${abs.toFixed(1)}`;
   }
@@ -700,14 +777,15 @@ function rowsForKpi(kpiId, factMainRows, adoptionRows) {
   return kpiId === "adoption" ? adoptionRows : factMainRows;
 }
 
-function runtimeKpi(kpi, rows) {
-  const actualValue = valueForKpi(rows, kpi.id);
+function runtimeKpi(kpi, rows, targetedRows) {
+  const isAdoption = kpi.id === "adoption";
+  const actualValue = isAdoption ? valueForAdoptionRate(rows, targetedRows) : valueForKpi(rows, kpi.id);
   // No usable backend data: show zero rather than the static registry
   // sample values — a plausible-looking number with no real data behind it
   // would mislead whoever's reading the dashboard.
   if (actualValue == null) return zeroedKpi(kpi);
-  const d7 = formatKpiDelta(deltaForKpi(rows, kpi.id, 7), kpi.id);
-  const d30 = formatKpiDelta(deltaForKpi(rows, kpi.id, 30), kpi.id);
+  const d7 = formatKpiDelta(isAdoption ? deltaForAdoptionRate(rows, targetedRows, 7) : deltaForKpi(rows, kpi.id, 7), kpi.id);
+  const d30 = formatKpiDelta(isAdoption ? deltaForAdoptionRate(rows, targetedRows, 30) : deltaForKpi(rows, kpi.id, 30), kpi.id);
   return {
     ...kpi,
     value: formatKpiValue(actualValue, kpi.id),
@@ -1341,7 +1419,7 @@ function DlcmLink({ icon: Icon, l1, l2, disabled, onClick }) {
   );
 }
 
-function Overview({ onOpen, onDlcm, filters, filteredRows, filteredAdoptionAggRows, aiSummaries }) {
+function Overview({ onOpen, onDlcm, filters, filteredRows, filteredAdoptionAggRows, filteredTargetedAggRows, aiSummaries }) {
   // Each primary card's insight is the top-ranked AI summary compatible with
   // this KPI and the active region/brand/platform filters. No match (e.g. a
   // filter combination the AI summaries don't cover) means no insight —
@@ -1350,8 +1428,8 @@ function Overview({ onOpen, onDlcm, filters, filteredRows, filteredAdoptionAggRo
     const s = summariesMatchingScope(aiSummaries, k.id, filters)[0];
     return { ...k, insight: s ? (s.headline || s.fact) : "", insightMeta: s ? formatInsightMeta(s) : "" };
   };
-  const primaries = KPIS.filter((k) => k.tier === "primary").map((k) => withLiveInsight(runtimeKpi(k, rowsForKpi(k.id, filteredRows, filteredAdoptionAggRows))));
-  const secondaries = KPIS.filter((k) => k.tier === "secondary").map((k) => runtimeKpi(k, rowsForKpi(k.id, filteredRows, filteredAdoptionAggRows)));
+  const primaries = KPIS.filter((k) => k.tier === "primary").map((k) => withLiveInsight(runtimeKpi(k, rowsForKpi(k.id, filteredRows, filteredAdoptionAggRows), filteredTargetedAggRows)));
+  const secondaries = KPIS.filter((k) => k.tier === "secondary").map((k) => runtimeKpi(k, rowsForKpi(k.id, filteredRows, filteredAdoptionAggRows), filteredTargetedAggRows));
   return (
     <div className="px-4 py-1.5 flex flex-col gap-1.5" style={{ minHeight: "100%" }}>
       <section className="flex-[4] min-h-0 flex flex-col">
@@ -1417,16 +1495,26 @@ function NoData({ label = "No data for the current filter selection" }) {
   );
 }
 
-function Detail({ kpiId, onBack, filters, filteredRows, filteredAdoptionAggRows, aiSummaries }) {
+function Detail({ kpiId, onBack, filters, filteredRows, filteredAdoptionAggRows, filteredTargetedAggRows, aiSummaries }) {
   const scope = filterScope(filters);
+  const isAdoption = kpiId === "adoption";
   const kpiRows = rowsForKpi(kpiId, filteredRows, filteredAdoptionAggRows);
-  const kpi = runtimeKpi(KPIS.find((k) => k.id === kpiId), kpiRows);
+  const kpi = runtimeKpi(KPIS.find((k) => k.id === kpiId), kpiRows, filteredTargetedAggRows);
   const [range, setRange] = useState(30);
   // Charts render backend rows only — an empty result shows an empty state,
   // never a synthetic series.
-  const series = useMemo(() => buildKpiSeries(kpiRows, kpiId, range), [kpiRows, kpiId, range]);
-  const byBrand = useMemo(() => buildKpiBreakdown(kpiRows, kpiId, "brand"), [kpiRows, kpiId]);
-  const byRegion = useMemo(() => buildKpiBreakdown(kpiRows, kpiId, "region"), [kpiRows, kpiId]);
+  const series = useMemo(
+    () => isAdoption ? buildAdoptionRateSeries(kpiRows, filteredTargetedAggRows, range) : buildKpiSeries(kpiRows, kpiId, range),
+    [kpiRows, kpiId, range, isAdoption, filteredTargetedAggRows]
+  );
+  const byBrand = useMemo(
+    () => isAdoption ? buildAdoptionRateBreakdown(kpiRows, filteredTargetedAggRows, "brand") : buildKpiBreakdown(kpiRows, kpiId, "brand"),
+    [kpiRows, kpiId, isAdoption, filteredTargetedAggRows]
+  );
+  const byRegion = useMemo(
+    () => isAdoption ? buildAdoptionRateBreakdown(kpiRows, filteredTargetedAggRows, "region") : buildKpiBreakdown(kpiRows, kpiId, "region"),
+    [kpiRows, kpiId, isAdoption, filteredTargetedAggRows]
+  );
   // Only summaries compatible with this KPI and the active region/brand/
   // platform filters — a mismatched selection yields [], not a fallback.
   const summaries = useMemo(
@@ -1815,6 +1903,7 @@ export default function App() {
   const [releaseRows, setReleaseRows] = useState([]);
   const [adoptionRows, setAdoptionRows] = useState([]);
   const [adoptionAggRows, setAdoptionAggRows] = useState([]);
+  const [targetedAggRows, setTargetedAggRows] = useState([]);
   const [aiSummaries, setAiSummaries] = useState([]);
   const [dataMode, setDataMode] = useState(null); // "live" | "local" | null (unknown yet)
   const [backendError, setBackendError] = useState(null);
@@ -1892,6 +1981,15 @@ export default function App() {
     [adoptionAggRows, filters]
   );
 
+  // fact_targeted_vehicles has no date column (a static per-campaign
+  // target, not a time series), so it's never excluded by the date-range
+  // filter (see dateInRange) — only cross-filtered by region/brand/
+  // platform/recall, same as every other dimension.
+  const filteredTargetedAggRows = useMemo(
+    () => targetedAggRows.filter((row) => matchesRowFilters(row, filters)),
+    [targetedAggRows, filters]
+  );
+
   const filteredReleaseRows = useMemo(() => {
     const rows = releaseRows.some((row) => row.brand !== undefined || row.country_name !== undefined || row.region !== undefined || row.recall !== undefined)
       ? releaseRows
@@ -1937,6 +2035,7 @@ export default function App() {
         const snapshot = await response.json();
         setBackendRows(Array.isArray(snapshot.fact_main) ? snapshot.fact_main : []);
         setAdoptionAggRows(Array.isArray(snapshot.fact_adoption_rate_agg) ? snapshot.fact_adoption_rate_agg : []);
+        setTargetedAggRows(Array.isArray(snapshot.fact_targeted_vehicles_agg) ? snapshot.fact_targeted_vehicles_agg : []);
         setCampaignRows(Array.isArray(snapshot.dim_campaign) ? snapshot.dim_campaign : []);
         setCountryRows(Array.isArray(snapshot.dim_country) ? snapshot.dim_country : []);
         setAiSummaries(Array.isArray(snapshot.fact_ai_summaries_latest) ? snapshot.fact_ai_summaries_latest : []);
@@ -2099,6 +2198,7 @@ export default function App() {
               filters={filters}
               filteredRows={filteredRows}
               filteredAdoptionAggRows={filteredAdoptionAggRows}
+              filteredTargetedAggRows={filteredTargetedAggRows}
               aiSummaries={aiSummaries}
               onOpen={(kpiId) => setRoute({ page: "detail", kpiId })}
               onDlcm={(name) => setRoute({ page: "dlcm", name })}
@@ -2107,6 +2207,7 @@ export default function App() {
           {route.page === "detail" && (
             <Detail kpiId={route.kpiId} filters={filters} filteredRows={filteredRows}
               filteredAdoptionAggRows={filteredAdoptionAggRows}
+              filteredTargetedAggRows={filteredTargetedAggRows}
               aiSummaries={aiSummaries} onBack={goHome} />
           )}
           {route.page === "dlcm" && dlcmLoading && <NoData label="Loading DLCM release data…" />}
